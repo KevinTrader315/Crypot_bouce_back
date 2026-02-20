@@ -283,13 +283,14 @@ if __name__ == "__main__":
     api_key = os.environ.get("KALSHI_API_KEY", "")
     key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
 
+    # Always init trader if credentials present — needed for live mode toggle at runtime
     trader = None
-    if args.mode == "live" and api_key and key_path:
+    if api_key and key_path:
         try:
             trader = KalshiTrader(api_key, key_path)
-            logger.info("Kalshi authenticated")
+            logger.info("Kalshi authenticated (ready for live mode)")
         except Exception as e:
-            logger.warning("Auth failed: %s — paper mode", e)
+            logger.warning("Auth failed: %s — live mode toggle will be unavailable", e)
 
     config = BounceConfig(
         mode=args.mode,
