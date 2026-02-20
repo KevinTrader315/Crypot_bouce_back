@@ -116,13 +116,18 @@ function drawChart(canvas, window_data, compact) {
   const c10_price   = window_data.c10_price;
   const trade       = window_data.trade;
 
-  // Y range: tight fit to actual data with small padding
+  // Y range: tight fit to data, always wide enough to show both signal bands
   const vals = prices.map(p => p[1]);
   const dataMin = Math.min(...vals);
   const dataMax = Math.max(...vals);
-  const pad = Math.max((dataMax - dataMin) * 0.2, 4);  // 20% of range or min 4¢
+  const pad = Math.max((dataMax - dataMin) * 0.2, 4);
   let yMin = Math.max(0,   Math.floor(dataMin - pad));
   let yMax = Math.min(100, Math.ceil(dataMax  + pad));
+  // Expand to always include both threshold bands so they're never clipped off-screen
+  if (c5_price != null) {
+    yMax = Math.min(100, Math.max(yMax, Math.ceil(c5_price  + threshold + 2)));
+    yMin = Math.max(0,   Math.min(yMin, Math.floor(c5_price - threshold - 2)));
+  }
   if (yMax - yMin < 12) { const mid = (yMin+yMax)/2; yMin = Math.max(0, Math.floor(mid-6)); yMax = Math.min(100, Math.ceil(mid+6)); }
 
   function xPx(s)   { return PAD.l + (s / WINDOW_SECS) * cW; }
@@ -169,19 +174,17 @@ function drawChart(canvas, window_data, compact) {
     ctx.setLineDash([4,4]);
     ctx.beginPath(); ctx.moveTo(xPx(c5_ref_s - 10), yC5); ctx.lineTo(xPx(entry_end + 30), yC5); ctx.stroke();
     ctx.setLineDash([]);
-    // +threshold band (signal line if contract ROSE → buy NO)
-    if (yPx(c5_price + threshold) >= PAD.t) {
-      ctx.strokeStyle = 'rgba(248,81,73,0.4)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([2,4]);
-      ctx.beginPath();
-      ctx.moveTo(xPx(c5_ref_s), yPx(c5_price + threshold));
-      ctx.lineTo(xPx(entry_end + 30), yPx(c5_price + threshold));
-      ctx.stroke();
-    }
-    // -threshold band (signal line if contract FELL → buy YES)
-    if (yPx(c5_price - threshold) <= PAD.t + cH) {
-      ctx.strokeStyle = 'rgba(63,185,80,0.4)';
+    // +threshold band — red dashed (contract ROSE above this → buy NO)
+    ctx.strokeStyle = 'rgba(248,81,73,0.6)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2,4]);
+    ctx.beginPath();
+    ctx.moveTo(xPx(c5_ref_s), yPx(c5_price + threshold));
+    ctx.lineTo(xPx(entry_end + 30), yPx(c5_price + threshold));
+    ctx.stroke();
+    // -threshold band — green dashed (contract FELL below this → buy YES)
+    if (true) {
+      ctx.strokeStyle = 'rgba(63,185,80,0.6)';
       ctx.lineWidth = 1;
       ctx.setLineDash([2,4]);
       ctx.beginPath();
