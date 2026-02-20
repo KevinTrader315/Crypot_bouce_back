@@ -64,7 +64,7 @@ class BounceConfig:
     lookback_secs: int = 300           # How far back to look for the "5 min ago" price
 
     # Entry
-    max_entry_price: float = 0.65      # Don't buy contracts already >65c
+    max_entry_price: float = 0.35      # Don't buy contracts already >35c (backtest avg ~30c)
     min_entry_price: float = 0.05      # Don't buy near-zero contracts
     base_contracts: int = 5            # Contracts per trade
     max_open_positions: int = 3        # Max simultaneous positions
