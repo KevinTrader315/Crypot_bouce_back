@@ -260,6 +260,7 @@ class BounceBackBot:
         self.price_cache = PriceCache()
         self.capital_guard = CapitalGuard("bounce-back")
         self.running = False
+        self.trading_enabled = True          # toggle via dashboard to pause entries
         self._entered_windows: set = set()  # prevent double-entry per window
         self._stats = {'signals': 0, 'trades': 0, 'skipped': 0}
 
@@ -560,6 +561,10 @@ class BounceBackBot:
                 signal['signal_move'], signal['entry_side'].upper(),
                 int(signal['secs_left'])
             )
+            if not self.trading_enabled:
+                logger.info("%s Trading paused — signal skipped", asset.upper())
+                self._stats['skipped'] += 1
+                continue
             self._execute(signal, event)
 
     def run(self):

@@ -9,7 +9,7 @@ import os
 import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 from bounce_bot import BounceBackBot, BounceConfig, KalshiTrader, ASSETS
 
@@ -28,6 +28,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Bounce-Back Bot</title>
 <meta http-equiv="refresh" content="15">
+<script>
+async function toggleTrading() {
+  const btn = document.getElementById('tradeBtn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/trading/toggle', {method:'POST'});
+    const d = await r.json();
+    updateBtn(d.trading_enabled);
+  } catch(e) { alert('Error: ' + e); }
+  btn.disabled = false;
+}
+function updateBtn(enabled) {
+  const btn = document.getElementById('tradeBtn');
+  if (!btn) return;
+  if (enabled) {
+    btn.textContent = '⏸ Pause Trading';
+    btn.style.background = 'rgba(248,81,73,0.15)';
+    btn.style.color = '#f85149';
+    btn.style.borderColor = 'rgba(248,81,73,0.3)';
+  } else {
+    btn.textContent = '▶ Resume Trading';
+    btn.style.background = 'rgba(63,185,80,0.15)';
+    btn.style.color = '#3fb950';
+    btn.style.borderColor = 'rgba(63,185,80,0.3)';
+  }
+}
+// Sync button state from API on load
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    updateBtn(d.trading_enabled !== false);
+  } catch(e) {}
+});
+</script>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;
         --green:#3fb950;--red:#f85149;--yellow:#e3b341;--accent:#58a6ff;--orange:#f0883e;}
@@ -54,7 +89,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Bounce-Back Bot v{{ version }} &mdash; <span class="mode-{{ mode }}">{{ mode.upper() }}</span></h1>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+  <h1 style="margin:0">Bounce-Back Bot v{{ version }} &mdash; <span class="mode-{{ mode }}">{{ mode.upper() }}</span></h1>
+  <button id="tradeBtn" onclick="toggleTrading()" style="
+    padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
+    font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
+    background:rgba(248,81,73,0.15);color:#f85149;border-color:rgba(248,81,73,0.3);">
+    ⏸ Pause Trading
+  </button>
+</div>
 <div class="grid">
   <div class="card">
     <h3>Performance</h3>
@@ -135,6 +178,17 @@ def index():
     )
 
 
+@app.route("/api/trading/toggle", methods=["POST"])
+def api_toggle_trading():
+    global bot
+    if not bot:
+        return jsonify({"error": "Bot not running"}), 503
+    bot.trading_enabled = not bot.trading_enabled
+    state = "enabled" if bot.trading_enabled else "paused"
+    logger.info("Trading %s via dashboard", state)
+    return jsonify({"trading_enabled": bot.trading_enabled, "state": state})
+
+
 @app.route("/api/status")
 def api_status():
     global bot
@@ -143,6 +197,7 @@ def api_status():
     return jsonify({
         "running": bot.running,
         "mode": bot.config.mode,
+        "trading_enabled": bot.trading_enabled,
         "summary": bot.trade_log.summary(),
         "stats": bot._stats,
         "open_trades": len(bot.trade_log.get_open()),
