@@ -123,10 +123,11 @@ function drawChart(canvas, window_data, compact) {
   const pad = Math.max((dataMax - dataMin) * 0.2, 4);
   let yMin = Math.max(0,   Math.floor(dataMin - pad));
   let yMax = Math.min(100, Math.ceil(dataMax  + pad));
-  // Expand to always include both threshold bands so they're never clipped off-screen
+  // Expand to always include both threshold bands (but don't pull yMin to 0 just because lower band clips)
   if (c5_price != null) {
-    yMax = Math.min(100, Math.max(yMax, Math.ceil(c5_price  + threshold + 2)));
-    yMin = Math.max(0,   Math.min(yMin, Math.floor(c5_price - threshold - 2)));
+    yMax = Math.min(100, Math.max(yMax, Math.ceil(c5_price + threshold + 2)));
+    const lowerBand = Math.floor(c5_price - threshold - 2);
+    if (lowerBand > 1) yMin = Math.max(0, Math.min(yMin, lowerBand));
   }
   if (yMax - yMin < 12) { const mid = (yMin+yMax)/2; yMin = Math.max(0, Math.floor(mid-6)); yMax = Math.min(100, Math.ceil(mid+6)); }
 
