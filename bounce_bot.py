@@ -268,7 +268,8 @@ class BounceBackBot:
     # ------------------------------------------------------------------
 
     def _fetch_markets(self, asset: str) -> list[dict]:
-        series = ASSET_SERIES.get(asset)
+        series_map = ASSET_SERIES.get(asset, {})
+        series = series_map.get("15m") if isinstance(series_map, dict) else series_map
         if not series:
             return []
         try:
@@ -448,7 +449,8 @@ class BounceBackBot:
 
             # Fetch settlement
             try:
-                series = ASSET_SERIES.get(trade.asset)
+                series_map = ASSET_SERIES.get(trade.asset, {})
+                series = series_map.get("15m") if isinstance(series_map, dict) else series_map
                 if not series:
                     continue
                 path = f"/trade-api/v2/markets?series_ticker={series}&status=settled&limit=20"
