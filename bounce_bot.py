@@ -60,7 +60,7 @@ class BounceConfig:
     # Signal
     move_threshold: float = 8.0        # Min contract move (cents) to trigger signal
     entry_window_min: int = 240        # Min seconds remaining when we check (4 min)
-    entry_window_max: int = 360        # Max seconds remaining when we check (6 min)
+    entry_window_max: int = 600        # Max seconds remaining when we check (10 min = 5 min into window)
     lookback_secs: int = 300           # How far back to look for the "5 min ago" price
 
     # Entry
@@ -334,8 +334,8 @@ class BounceBackBot:
         if now_price is None:
             return None
 
-        # Price ~5 minutes ago (at the start of this check window)
-        target_5m_ago = close_ts - self.config.lookback_secs
+        # Price ~5 minutes ago relative to NOW (works at any point in the window)
+        target_5m_ago = now_ts - self.config.lookback_secs
         price_5m_ago = self.price_cache.price_at(event_ticker, target_5m_ago)
         if price_5m_ago is None:
             return None
