@@ -29,6 +29,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <title>Bounce-Back Bot</title>
 <meta http-equiv="refresh" content="15">
 <script>
+async function toggleMode() {
+  const btn = document.getElementById('modeBtn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/mode/toggle', {method:'POST'});
+    const d = await r.json();
+    if (d.error) { alert(d.error); updateModeBtn(d.mode || 'paper'); }
+    else updateModeBtn(d.mode);
+  } catch(e) { alert('Error: ' + e); }
+  btn.disabled = false;
+}
+function updateModeBtn(mode) {
+  const btn = document.getElementById('modeBtn');
+  if (!btn) return;
+  const isLive = mode === 'live';
+  btn.textContent = isLive ? '● LIVE — Switch to Paper' : '○ PAPER — Switch to Live';
+  btn.style.background = isLive ? 'rgba(63,185,80,0.15)' : 'rgba(227,179,65,0.12)';
+  btn.style.color = isLive ? '#3fb950' : '#e3b341';
+  btn.style.borderColor = isLive ? 'rgba(63,185,80,0.3)' : 'rgba(227,179,65,0.25)';
+}
 async function toggleTrading() {
   const btn = document.getElementById('tradeBtn');
   btn.disabled = true;
@@ -54,12 +74,13 @@ function updateBtn(enabled) {
     btn.style.borderColor = 'rgba(63,185,80,0.3)';
   }
 }
-// Sync button state from API on load
+// Sync button states from API on load
 window.addEventListener('DOMContentLoaded', async () => {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
     updateBtn(d.trading_enabled !== false);
+    updateModeBtn(d.mode || 'paper');
   } catch(e) {}
 });
 </script>
@@ -91,12 +112,20 @@ window.addEventListener('DOMContentLoaded', async () => {
 <body>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
   <h1 style="margin:0">Bounce-Back Bot v{{ version }} &mdash; <span class="mode-{{ mode }}">{{ mode.upper() }}</span></h1>
-  <button id="tradeBtn" onclick="toggleTrading()" style="
-    padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
-    font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
-    background:rgba(248,81,73,0.15);color:#f85149;border-color:rgba(248,81,73,0.3);">
-    ⏸ Pause Trading
-  </button>
+  <div style="display:flex;gap:0.5rem;">
+    <button id="modeBtn" onclick="toggleMode()" style="
+      padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
+      font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
+      background:rgba(227,179,65,0.12);color:#e3b341;border-color:rgba(227,179,65,0.25);">
+      ○ PAPER — Switch to Live
+    </button>
+    <button id="tradeBtn" onclick="toggleTrading()" style="
+      padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
+      font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
+      background:rgba(248,81,73,0.15);color:#f85149;border-color:rgba(248,81,73,0.3);">
+      ⏸ Pause Trading
+    </button>
+  </div>
 </div>
 <div class="grid">
   <div class="card">
@@ -176,6 +205,23 @@ def index():
         max_open=cfg.max_open_positions,
         poll=cfg.poll_interval,
     )
+
+
+@app.route("/api/mode/toggle", methods=["POST"])
+def api_toggle_mode():
+    global bot
+    if not bot:
+        return jsonify({"error": "Bot not running"}), 503
+    if bot.config.mode == "live":
+        bot.config.mode = "paper"
+    else:
+        bot.config.mode = "live"
+        # Require Kalshi auth to go live
+        if bot.trader is None:
+            bot.config.mode = "paper"
+            return jsonify({"error": "No Kalshi credentials — cannot switch to live", "mode": "paper"}), 400
+    logger.info("Mode switched to %s via dashboard", bot.config.mode.upper())
+    return jsonify({"mode": bot.config.mode})
 
 
 @app.route("/api/trading/toggle", methods=["POST"])
