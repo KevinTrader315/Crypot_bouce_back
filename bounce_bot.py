@@ -535,13 +535,15 @@ class BounceBackBot:
                 continue
 
             # Update price cache for all open events
+            # markets are already parsed by parse_kalshi_bracket so yes_bid/ask are 0-1 fractions
+            # Store as cents (0-100) for the chart
             for m in markets:
                 et = m.get('event_ticker')
                 if et:
                     yes_bid = m.get('yes_bid') or 0
-                    yes_ask = m.get('yes_ask') or 100
+                    yes_ask = m.get('yes_ask') or 1
                     yes_mid = (yes_bid + yes_ask) / 2
-                    self.price_cache.record(et, yes_mid)
+                    self.price_cache.record(et, yes_mid * 100)  # store as cents
                     # Track window metadata for timeline
                     if et not in self._window_meta:
                         ct = m.get('close_time', '')
