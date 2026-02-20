@@ -73,16 +73,19 @@ function updateBtn(enabled) {
     btn.style.borderColor = 'rgba(63,185,80,0.3)';
   }
 }
-// Sync button states from API on load
-window.addEventListener('DOMContentLoaded', async () => {
+// Sync button states + live config from API on load and each refresh
+async function syncStatus() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
     updateBtn(d.trading_enabled !== false);
     updateModeBtn(d.mode || 'paper');
+    // Keep contracts input in sync with live bot value
+    const inp = document.getElementById('contractsInput');
+    if (inp && d.base_contracts != null) inp.value = d.base_contracts;
   } catch(e) {}
-  startAutoRefresh();
-});
+}
+window.addEventListener('DOMContentLoaded', () => { syncStatus(); startAutoRefresh(); });
 
 // ── Timeline chart ──────────────────────────────────────────────
 const ASSET_COLORS = {btc:'#f7931a', eth:'#627eea', sol:'#9945ff'};
@@ -408,6 +411,7 @@ function startAutoRefresh() {
   fetchStats();
   setInterval(fetchTimeline, 5000);
   setInterval(fetchStats, 5000);
+  setInterval(syncStatus, 5000);
   setInterval(tickCountdowns, 1000);
 }
 </script>
@@ -590,6 +594,12 @@ def api_status():
         "summary": bot.trade_log.summary(),
         "stats": bot._stats,
         "open_trades": len(bot.trade_log.get_open()),
+        # Live config — included so portal rules tab and bot dashboard stay in sync
+        "base_contracts": bot.config.base_contracts,
+        "move_threshold": bot.config.move_threshold,
+        "entry_window_min": bot.config.entry_window_min,
+        "entry_window_max": bot.config.entry_window_max,
+        "max_open_positions": bot.config.max_open_positions,
     })
 
 
