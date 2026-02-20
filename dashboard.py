@@ -388,11 +388,23 @@ async function fetchStats() {
   } catch(e) {}
 }
 
+async function saveContracts() {
+  const val = parseInt(document.getElementById('contractsInput').value);
+  const fb = document.getElementById('contractsFb');
+  if (!val || val < 1 || val > 50) { fb.textContent = 'invalid'; fb.style.color='var(--red)'; return; }
+  try {
+    const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base_contracts: val})});
+    const d = await r.json();
+    if (d.ok) { fb.textContent = '✓ saved'; fb.style.color='var(--green)'; setTimeout(()=>fb.textContent='', 2000); }
+    else { fb.textContent = d.error || 'error'; fb.style.color='var(--red)'; }
+  } catch(e) { fb.textContent = 'error'; fb.style.color='var(--red)'; }
+}
+
 function startAutoRefresh() {
   fetchTimeline();
   fetchStats();
-  setInterval(fetchTimeline, 15000);
-  setInterval(fetchStats, 15000);
+  setInterval(fetchTimeline, 5000);
+  setInterval(fetchStats, 5000);
   setInterval(tickCountdowns, 1000);
 }
 </script>
@@ -468,9 +480,20 @@ function startAutoRefresh() {
     <div class="stat"><span class="stat-l">Signal Threshold</span><span class="stat-v">{{ threshold }}¢ move</span></div>
     <div class="stat"><span class="stat-l">Entry Window</span><span class="stat-v">{{ entry_min }}-{{ entry_max }}s remaining</span></div>
     <div class="stat"><span class="stat-l">c5 Lookback</span><span class="stat-v">{{ lookback }}s before close</span></div>
-    <div class="stat"><span class="stat-l">Base Contracts</span><span class="stat-v">{{ contracts }}</span></div>
-    <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
+    <div class="stat">
+      <span class="stat-l">Base Contracts</span>
+      <span class="stat-v" style="display:flex;align-items:center;gap:.4rem">
+        <input id="contractsInput" type="number" min="1" max="50" value="{{ contracts }}"
+          style="width:3.5rem;background:#0d1117;border:1px solid #30363d;border-radius:4px;
+                 color:#e6edf3;font-family:monospace;font-size:.8rem;padding:1px 4px;text-align:center">
+        <button onclick="saveContracts()" style="padding:1px 8px;border-radius:4px;cursor:pointer;
+          font-family:monospace;font-size:.75rem;border:1px solid #30363d;background:#161b22;color:#58a6ff">
+          Save</button>
+        <span id="contractsFb" style="font-size:.7rem;color:var(--dim)"></span>
+      </span>
+    </div>
     <div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">{{ max_open }}</span></div>
+    <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
   </div>
   <div class="card" style="grid-column:1/-1">
     <div class="tl-legend">
@@ -574,6 +597,26 @@ def api_trades():
         return jsonify({"trades": []})
     trades = [t.__dict__ for t in bot.trade_log.all()]
     return jsonify({"trades": trades[-50:], "summary": bot.trade_log.summary()})
+
+
+@app.route("/api/config", methods=["POST"])
+def api_config():
+    global bot
+    if not bot:
+        return jsonify({"error": "Bot not running"}), 503
+    data = request.get_json() or {}
+    changed = []
+    if "base_contracts" in data:
+        val = int(data["base_contracts"])
+        if 1 <= val <= 50:
+            bot.config.base_contracts = val
+            changed.append(f"base_contracts={val}")
+        else:
+            return jsonify({"error": "base_contracts must be 1-50"}), 400
+    if not changed:
+        return jsonify({"error": "No valid fields provided"}), 400
+    logger.info("Config updated via dashboard: %s", ", ".join(changed))
+    return jsonify({"ok": True, "changed": changed})
 
 
 @app.route("/api/timeline")
