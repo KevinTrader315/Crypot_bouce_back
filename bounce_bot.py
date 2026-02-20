@@ -263,6 +263,8 @@ class BounceBackBot:
         self.trading_enabled = True          # toggle via dashboard to pause entries
         self._entered_windows: set = set()  # prevent double-entry per window
         self._stats = {'signals': 0, 'trades': 0, 'skipped': 0}
+        # event_ticker -> {asset, close_time_ts, close_time_str, window_start_ts}
+        self._window_meta: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Market fetching
@@ -540,6 +542,20 @@ class BounceBackBot:
                     yes_ask = m.get('yes_ask') or 100
                     yes_mid = (yes_bid + yes_ask) / 2
                     self.price_cache.record(et, yes_mid)
+                    # Track window metadata for timeline
+                    if et not in self._window_meta:
+                        ct = m.get('close_time', '')
+                        try:
+                            close_ts = datetime.fromisoformat(ct.replace('Z', '+00:00')).timestamp()
+                            window_start_ts = close_ts - 900  # 15-min window
+                            self._window_meta[et] = {
+                                'asset': asset,
+                                'close_time_ts': close_ts,
+                                'close_time_str': ct,
+                                'window_start_ts': window_start_ts,
+                            }
+                        except Exception:
+                            pass
 
             # Find event in the entry window
             event = self._find_active_event(markets)
@@ -566,6 +582,112 @@ class BounceBackBot:
                 self._stats['skipped'] += 1
                 continue
             self._execute(signal, event)
+
+    # ------------------------------------------------------------------
+    # Timeline data for dashboard
+    # ------------------------------------------------------------------
+
+    def get_timeline_data(self) -> dict:
+        """Return price history per asset for the timeline chart.
+
+        Returns a dict keyed by asset, each containing:
+          - current_window: latest window with full price series
+          - recent_windows: last 5 completed windows with summary stats
+        """
+        now = time.time()
+        result = {}
+
+        for asset in ASSETS:
+            # Find all windows for this asset, sorted newest first
+            asset_windows = sorted(
+                [(et, meta) for et, meta in self._window_meta.items()
+                 if meta['asset'] == asset],
+                key=lambda x: x[1]['close_time_ts'],
+                reverse=True
+            )
+
+            current_window = None
+            recent_windows = []
+
+            for et, meta in asset_windows:
+                close_ts = meta['close_time_ts']
+                window_start_ts = meta['window_start_ts']
+                is_current = close_ts > now - 30  # still open or just closed
+
+                # Get price series from cache
+                with self.price_cache._lock:
+                    raw = list(self.price_cache._data.get(et, []))
+
+                if not raw:
+                    continue
+
+                # Convert to [elapsed_s, price_cents] relative to window start
+                prices = []
+                for ts, price in raw:
+                    elapsed = round(ts - window_start_ts, 1)
+                    if 0 <= elapsed <= 960:  # within window + small buffer
+                        prices.append([elapsed, round(price, 1)])
+
+                if not prices:
+                    continue
+
+                # Entry window bounds in elapsed seconds
+                entry_start_s = 900 - self.config.entry_window_max  # 540
+                entry_end_s   = 900 - self.config.entry_window_min  # 660
+                c5_ref_s      = 900 - self.config.lookback_secs      # 600
+
+                # Find c5 and c10 prices from the price series
+                def price_at_elapsed(target_s, tol=45):
+                    best = min(prices, key=lambda p: abs(p[0] - target_s))
+                    return best[1] if abs(best[0] - target_s) <= tol else None
+
+                c5_price  = price_at_elapsed(c5_ref_s)
+                c10_price = price_at_elapsed((entry_start_s + entry_end_s) / 2)
+
+                # Check if a trade was taken for this window
+                trade_info = None
+                for t in self.trade_log.all():
+                    if t.event_ticker == et:
+                        trade_info = {
+                            'side': t.entry_side,
+                            'price': round(t.entry_price * 100, 1),
+                            'contracts': t.contracts,
+                            'signal_move': round(t.signal_move, 1),
+                            'status': t.status,
+                            'result': t.result,
+                            'pnl': round(t.pnl_net, 3),
+                            'won': t.pnl_net > 0 if t.status == 'settled' else None,
+                        }
+                        break
+
+                window_data = {
+                    'event_ticker': et,
+                    'close_time': meta['close_time_str'],
+                    'window_start_ts': window_start_ts,
+                    'close_ts': close_ts,
+                    'prices': prices,
+                    'entry_start_s': entry_start_s,
+                    'entry_end_s': entry_end_s,
+                    'c5_ref_s': c5_ref_s,
+                    'c5_price': c5_price,
+                    'c10_price': c10_price,
+                    'threshold': self.config.move_threshold,
+                    'trade': trade_info,
+                }
+
+                if is_current and current_window is None:
+                    window_data['elapsed_s'] = round(now - window_start_ts, 1)
+                    window_data['seconds_remaining'] = round(close_ts - now, 1)
+                    current_window = window_data
+                elif not is_current and len(recent_windows) < 6:
+                    recent_windows.append(window_data)
+
+            result[asset] = {
+                'current_window': current_window,
+                'recent_windows': recent_windows,
+            }
+
+        return result
 
     def run(self):
         self.running = True

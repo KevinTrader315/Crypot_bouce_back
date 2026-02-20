@@ -27,7 +27,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Bounce-Back Bot</title>
-<meta http-equiv="refresh" content="15">
 <script>
 async function toggleMode() {
   const btn = document.getElementById('modeBtn');
@@ -82,7 +81,320 @@ window.addEventListener('DOMContentLoaded', async () => {
     updateBtn(d.trading_enabled !== false);
     updateModeBtn(d.mode || 'paper');
   } catch(e) {}
+  startAutoRefresh();
 });
+
+// ── Timeline chart ──────────────────────────────────────────────
+const ASSET_COLORS = {btc:'#f7931a', eth:'#627eea', sol:'#9945ff'};
+const WINDOW_SECS = 900;
+
+function drawChart(canvas, window_data, compact) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const PAD = compact ? {t:8,r:8,b:18,l:30} : {t:12,r:12,b:28,l:38};
+  const cW = W - PAD.l - PAD.r, cH = H - PAD.t - PAD.b;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (!window_data || !window_data.prices || window_data.prices.length < 2) {
+    ctx.fillStyle = '#555';
+    ctx.font = `${compact?9:11}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('No data yet', W/2, H/2);
+    return;
+  }
+
+  const prices = window_data.prices;
+  const threshold = window_data.threshold || 8;
+  const entry_start = window_data.entry_start_s || 540;
+  const entry_end   = window_data.entry_end_s   || 660;
+  const c5_ref_s    = window_data.c5_ref_s      || 600;
+  const c5_price    = window_data.c5_price;
+  const c10_price   = window_data.c10_price;
+  const trade       = window_data.trade;
+
+  // Y range: auto-fit with padding
+  const vals = prices.map(p => p[1]);
+  let yMin = Math.max(0,  Math.floor(Math.min(...vals) - 8));
+  let yMax = Math.min(100, Math.ceil(Math.max(...vals) + 8));
+  if (yMax - yMin < 20) { yMin = Math.max(0, yMin - 5); yMax = Math.min(100, yMax + 5); }
+
+  function xPx(s)   { return PAD.l + (s / WINDOW_SECS) * cW; }
+  function yPx(c)   { return PAD.t + cH - ((c - yMin) / (yMax - yMin)) * cH; }
+
+  // Background
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#1e2a3a';
+  ctx.lineWidth = 1;
+  for (let v = Math.ceil(yMin/10)*10; v <= yMax; v += 10) {
+    const y = yPx(v);
+    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(PAD.l + cW, y); ctx.stroke();
+    ctx.fillStyle = '#444'; ctx.font = `${compact?7:9}px monospace`; ctx.textAlign = 'right';
+    ctx.fillText(v + '¢', PAD.l - 3, y + 3);
+  }
+  if (!compact) {
+    for (let s = 0; s <= WINDOW_SECS; s += 180) {
+      const x = xPx(s);
+      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + cH); ctx.stroke();
+      ctx.fillStyle = '#444'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
+      ctx.fillText((s/60).toFixed(0)+'m', x, PAD.t + cH + 12);
+    }
+  }
+
+  // Entry window shading
+  ctx.fillStyle = 'rgba(227,179,65,0.07)';
+  ctx.fillRect(xPx(entry_start), PAD.t, xPx(entry_end) - xPx(entry_start), cH);
+  ctx.strokeStyle = 'rgba(227,179,65,0.25)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3,3]);
+  ctx.beginPath(); ctx.moveTo(xPx(entry_start), PAD.t); ctx.lineTo(xPx(entry_start), PAD.t+cH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(xPx(entry_end),   PAD.t); ctx.lineTo(xPx(entry_end),   PAD.t+cH); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // c5 reference line + threshold bands
+  if (c5_price != null) {
+    const yC5 = yPx(c5_price);
+    // Center line (c5 price)
+    ctx.strokeStyle = 'rgba(88,166,255,0.35)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(xPx(c5_ref_s - 10), yC5); ctx.lineTo(xPx(entry_end + 30), yC5); ctx.stroke();
+    ctx.setLineDash([]);
+    // +threshold band (signal line if contract ROSE → buy NO)
+    if (yPx(c5_price + threshold) >= PAD.t) {
+      ctx.strokeStyle = 'rgba(248,81,73,0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2,4]);
+      ctx.beginPath();
+      ctx.moveTo(xPx(c5_ref_s), yPx(c5_price + threshold));
+      ctx.lineTo(xPx(entry_end + 30), yPx(c5_price + threshold));
+      ctx.stroke();
+    }
+    // -threshold band (signal line if contract FELL → buy YES)
+    if (yPx(c5_price - threshold) <= PAD.t + cH) {
+      ctx.strokeStyle = 'rgba(63,185,80,0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2,4]);
+      ctx.beginPath();
+      ctx.moveTo(xPx(c5_ref_s), yPx(c5_price - threshold));
+      ctx.lineTo(xPx(entry_end + 30), yPx(c5_price - threshold));
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // c5 dot
+    ctx.fillStyle = '#58a6ff';
+    ctx.beginPath(); ctx.arc(xPx(c5_ref_s), yC5, compact?3:4, 0, Math.PI*2); ctx.fill();
+    if (!compact) {
+      ctx.fillStyle = '#58a6ff'; ctx.font = '8px monospace'; ctx.textAlign = 'left';
+      ctx.fillText('c5', xPx(c5_ref_s)+5, yC5-4);
+    }
+  }
+
+  // Price line
+  const asset = window_data.event_ticker ? (
+    window_data.event_ticker.includes('BTC') ? 'btc' :
+    window_data.event_ticker.includes('ETH') ? 'eth' : 'sol'
+  ) : 'btc';
+  ctx.strokeStyle = ASSET_COLORS[asset] || '#f7931a';
+  ctx.lineWidth = compact ? 1.5 : 2;
+  ctx.beginPath();
+  prices.forEach(([s, p], i) => {
+    const x = xPx(s), y = yPx(p);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // c10 dot (current price at entry moment)
+  if (c10_price != null) {
+    const entryMid = (entry_start + entry_end) / 2;
+    ctx.fillStyle = '#e3b341';
+    ctx.beginPath(); ctx.arc(xPx(entryMid), yPx(c10_price), compact?3:5, 0, Math.PI*2); ctx.fill();
+    if (!compact) {
+      ctx.fillStyle = '#e3b341'; ctx.font = '8px monospace'; ctx.textAlign = 'left';
+      ctx.fillText('c10', xPx(entryMid)+5, yPx(c10_price)-4);
+    }
+  }
+
+  // Trade entry marker
+  if (trade) {
+    const entryMid = (entry_start + entry_end) / 2;
+    const entryPx  = yPx(trade.price);
+    const won = trade.won;
+    const markerColor = won === true ? '#3fb950' : won === false ? '#f85149' : '#e3b341';
+    ctx.fillStyle = markerColor;
+    // Triangle marker
+    ctx.beginPath();
+    if (trade.side === 'yes') {
+      ctx.moveTo(xPx(entryMid), entryPx - (compact?6:9));
+      ctx.lineTo(xPx(entryMid) - (compact?4:6), entryPx + (compact?2:3));
+      ctx.lineTo(xPx(entryMid) + (compact?4:6), entryPx + (compact?2:3));
+    } else {
+      ctx.moveTo(xPx(entryMid), entryPx + (compact?6:9));
+      ctx.lineTo(xPx(entryMid) - (compact?4:6), entryPx - (compact?2:3));
+      ctx.lineTo(xPx(entryMid) + (compact?4:6), entryPx - (compact?2:3));
+    }
+    ctx.closePath(); ctx.fill();
+    if (!compact) {
+      ctx.fillStyle = markerColor; ctx.font = 'bold 8px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(trade.side.toUpperCase() + ' ' + trade.price + '¢', xPx(entryMid), entryPx + (trade.side==='yes'?-13:16));
+    }
+  }
+
+  // "Now" cursor for current window
+  if (window_data.elapsed_s != null) {
+    const nowX = xPx(Math.min(window_data.elapsed_s, WINDOW_SECS));
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(nowX, PAD.t); ctx.lineTo(nowX, PAD.t+cH); ctx.stroke();
+    if (!compact) {
+      ctx.fillStyle = '#aaa'; ctx.font = '8px monospace'; ctx.textAlign = 'center';
+      const secsLeft = window_data.seconds_remaining;
+      ctx.fillText(secsLeft > 0 ? Math.round(secsLeft)+'s left' : 'closed', nowX, PAD.t - 2);
+    }
+  }
+}
+
+function renderTimeline(data) {
+  const container = document.getElementById('timeline-container');
+  if (!container) return;
+
+  let html = '';
+  for (const asset of ['btc','eth','sol']) {
+    const d = data[asset] || {};
+    const cw = d.current_window;
+    const rw = d.recent_windows || [];
+    const color = ASSET_COLORS[asset];
+
+    html += `<div class="tl-asset">
+      <div class="tl-asset-label" style="color:${color}">${asset.toUpperCase()}</div>
+      <div class="tl-body">`;
+
+    // Current window
+    html += `<div class="tl-current">
+      <div class="tl-section-label">Current Window
+        ${cw ? `<span style="color:#555;font-size:.7rem;margin-left:.5rem">${cw.event_ticker||''}</span>` : ''}
+        ${cw && cw.seconds_remaining > 0 ? `<span class="tl-countdown" id="cd-${asset}">${Math.round(cw.seconds_remaining)}s</span>` : ''}
+      </div>
+      <canvas id="canvas-${asset}-current" width="820" height="130" style="display:block;max-width:100%"></canvas>
+    </div>`;
+
+    // Recent windows
+    if (rw.length > 0) {
+      html += `<div class="tl-section-label" style="margin-top:.75rem">Recent Windows</div>`;
+      html += `<div class="tl-recent-grid">`;
+      for (let i = 0; i < rw.length; i++) {
+        const w = rw[i];
+        const trade = w.trade;
+        const move = w.c5_price != null && w.c10_price != null ? (w.c10_price - w.c5_price) : null;
+        const signalFired = move != null && Math.abs(move) >= (w.threshold || 8);
+        const label = w.close_time ? w.close_time.substring(11,16)+'Z' : '';
+        const tradeLabel = trade ? `<span class="tl-trade-badge" style="color:${trade.won===true?'#3fb950':trade.won===false?'#f85149':'#e3b341'}">${trade.side.toUpperCase()} ${trade.price}¢ ${trade.won===true?'✓':trade.won===false?'✗':'…'}</span>` : (signalFired ? '<span style="color:#555;font-size:.65rem">signal — no trade</span>' : '');
+        html += `<div class="tl-recent-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+            <span style="font-size:.65rem;color:#555">${label}</span>${tradeLabel}
+          </div>
+          <canvas id="canvas-${asset}-recent-${i}" width="160" height="65" style="display:block;width:100%"></canvas>
+          <div style="font-size:.65rem;color:#555;margin-top:3px;display:flex;justify-content:space-between">
+            <span>c5: ${w.c5_price!=null?Math.round(w.c5_price)+'¢':'—'}</span>
+            <span>c10: ${w.c10_price!=null?Math.round(w.c10_price)+'¢':'—'}</span>
+            <span style="color:${move!=null&&move>0?'#3fb950':move!=null&&move<0?'#f85149':'#555'}">${move!=null?(move>0?'+':'')+move.toFixed(1)+'¢':'—'}</span>
+          </div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    html += `</div></div>`;
+  }
+  container.innerHTML = html;
+
+  // Draw all canvases
+  for (const asset of ['btc','eth','sol']) {
+    const d = data[asset] || {};
+    const cw = d.current_window;
+    const rw = d.recent_windows || [];
+    const cvs = document.getElementById(`canvas-${asset}-current`);
+    if (cvs) { cvs.width = cvs.offsetWidth || 820; drawChart(cvs, cw, false); }
+    for (let i = 0; i < rw.length; i++) {
+      const rc = document.getElementById(`canvas-${asset}-recent-${i}`);
+      if (rc) { rc.width = rc.offsetWidth || 160; drawChart(rc, rw[i], true); }
+    }
+  }
+
+  // Store countdowns
+  window._tlCountdowns = {};
+  for (const asset of ['btc','eth','sol']) {
+    const cw = (data[asset]||{}).current_window;
+    if (cw && cw.seconds_remaining > 0) {
+      window._tlCountdowns[asset] = {ends: Date.now() + cw.seconds_remaining * 1000};
+    }
+  }
+}
+
+function tickCountdowns() {
+  if (!window._tlCountdowns) return;
+  for (const [asset, cd] of Object.entries(window._tlCountdowns)) {
+    const el = document.getElementById('cd-' + asset);
+    if (!el) continue;
+    const left = Math.round((cd.ends - Date.now()) / 1000);
+    el.textContent = left > 0 ? left + 's' : 'settling…';
+    el.style.color = left < 60 ? '#f85149' : left < 180 ? '#e3b341' : '#3fb950';
+  }
+}
+
+async function fetchTimeline() {
+  try {
+    const r = await fetch('/api/timeline');
+    const d = await r.json();
+    renderTimeline(d);
+  } catch(e) {}
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/trades');
+    const d = await r.json();
+    const s = d.summary || {};
+    const el = document.getElementById('stats-card');
+    if (!el) return;
+    const wr = s.settled ? (s.win_rate*100).toFixed(1)+'% ('+s.wins+'/'+s.settled+')' : '—';
+    const pnl = s.total_pnl ? '$'+(s.total_pnl>=0?'+':'')+s.total_pnl.toFixed(3) : '$0.000';
+    el.innerHTML = `
+      <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">${s.total||0}</span></div>
+      <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">${s.open||0}</span></div>
+      <div class="stat"><span class="stat-l">Settled</span><span class="stat-v">${s.settled||0}</span></div>
+      <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v ${s.win_rate>=0.6?'pos':s.win_rate>0&&s.win_rate<0.4?'neg':''}">${wr}</span></div>
+      <div class="stat"><span class="stat-l">Total P&amp;L</span><span class="stat-v ${s.total_pnl>=0?'pos':'neg'}">${pnl}</span></div>`;
+
+    // Recent trades table
+    const trades = (d.trades || []).slice(-20).reverse();
+    const tbl = document.getElementById('trades-table');
+    if (!tbl) return;
+    if (!trades.length) { tbl.innerHTML = '<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">No trades yet</td></tr>'; return; }
+    tbl.innerHTML = trades.map(t => `<tr>
+      <td>${t.entry_time.substring(11,19)}</td>
+      <td style="font-weight:700;color:var(--orange)">${t.asset.toUpperCase()}</td>
+      <td><span class="badge badge-${t.entry_side}">${t.entry_side.toUpperCase()}</span></td>
+      <td>${Math.round(t.entry_price*100)}¢</td>
+      <td>${t.contracts}</td>
+      <td style="color:${t.signal_move>0?'var(--green)':'var(--red)'}">${t.signal_move>0?'+':''}${t.signal_move.toFixed(1)}¢</td>
+      <td style="font-size:.7rem;color:var(--dim)">${Math.round(t.c5_price)}→${Math.round(t.c10_price)}¢</td>
+      <td><span class="badge badge-${t.status}">${t.status.toUpperCase()}</span></td>
+      <td class="${t.pnl_net>0?'pos':t.pnl_net<0?'neg':''}">${t.pnl_net?'$'+t.pnl_net.toFixed(3):'—'}</td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+function startAutoRefresh() {
+  fetchTimeline();
+  fetchStats();
+  setInterval(fetchTimeline, 15000);
+  setInterval(fetchStats, 15000);
+  setInterval(tickCountdowns, 1000);
+}
 </script>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--dim:#8b949e;
@@ -107,6 +419,18 @@ window.addEventListener('DOMContentLoaded', async () => {
   .badge-open{background:rgba(88,166,255,.15);color:var(--accent);}
   .badge-settled{background:rgba(139,148,158,.15);color:var(--dim);}
   .mode-paper{color:var(--yellow);}  .mode-live{color:var(--green);}
+  /* Timeline */
+  .tl-asset{margin-bottom:1.25rem;}
+  .tl-asset-label{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:.4rem;}
+  .tl-body{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.75rem;}
+  .tl-section-label{font-size:.65rem;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:.4rem;display:flex;align-items:center;gap:.5rem;}
+  .tl-countdown{font-size:.7rem;font-weight:700;color:var(--green);background:rgba(63,185,80,.1);padding:1px 6px;border-radius:3px;}
+  .tl-current canvas{border-radius:4px;background:#0d1117;}
+  .tl-recent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.5rem;}
+  .tl-recent-card{background:#0d1520;border:1px solid #1e2a3a;border-radius:6px;padding:.4rem;}
+  .tl-trade-badge{font-size:.65rem;font-weight:700;}
+  .tl-legend{display:flex;gap:1rem;font-size:.65rem;color:var(--dim);margin-top:.35rem;flex-wrap:wrap;}
+  .tl-legend span{display:flex;align-items:center;gap:.3rem;}
 </style>
 </head>
 <body>
@@ -127,59 +451,52 @@ window.addEventListener('DOMContentLoaded', async () => {
     </button>
   </div>
 </div>
+
 <div class="grid">
   <div class="card">
     <h3>Performance</h3>
-    {% set s = summary %}
-    <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">{{ s.total }}</span></div>
-    <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">{{ s.open }}</span></div>
-    <div class="stat"><span class="stat-l">Settled</span><span class="stat-v">{{ s.settled }}</span></div>
-    <div class="stat"><span class="stat-l">Win Rate</span>
-      <span class="stat-v {% if s.win_rate >= 0.6 %}pos{% elif s.win_rate >= 0.4 %}{% else %}neg{% endif %}">
-        {% if s.settled %}{{ "%.1f"|format(s.win_rate*100) }}% ({{ s.wins }}/{{ s.settled }}){% else %}—{% endif %}
-      </span></div>
-    <div class="stat"><span class="stat-l">Total P&L</span>
-      <span class="stat-v {% if s.total_pnl >= 0 %}pos{% else %}neg{% endif %}">
-        {% if s.total_pnl %}${{ "%.3f"|format(s.total_pnl) }}{% else %}$0.000{% endif %}
-      </span></div>
+    <div id="stats-card">
+      <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">{{ summary.total }}</span></div>
+      <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">{{ summary.open }}</span></div>
+      <div class="stat"><span class="stat-l">Settled</span><span class="stat-v">{{ summary.settled }}</span></div>
+      <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v">—</span></div>
+      <div class="stat"><span class="stat-l">Total P&L</span><span class="stat-v">$0.000</span></div>
+    </div>
   </div>
   <div class="card">
     <h3>Config</h3>
     <div class="stat"><span class="stat-l">Signal Threshold</span><span class="stat-v">{{ threshold }}¢ move</span></div>
-    <div class="stat"><span class="stat-l">Entry Window</span><span class="stat-v">{{ entry_min }}-{{ entry_max }}s to close</span></div>
+    <div class="stat"><span class="stat-l">Entry Window</span><span class="stat-v">{{ entry_min }}-{{ entry_max }}s remaining</span></div>
+    <div class="stat"><span class="stat-l">c5 Lookback</span><span class="stat-v">{{ lookback }}s before close</span></div>
     <div class="stat"><span class="stat-l">Base Contracts</span><span class="stat-v">{{ contracts }}</span></div>
     <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
     <div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">{{ max_open }}</span></div>
-    <div class="stat"><span class="stat-l">Poll</span><span class="stat-v">{{ poll }}s</span></div>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <div class="tl-legend">
+      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="#e3b341" stroke-width="1.5" stroke-dasharray="3,3"/></svg> Entry window ({{ entry_min }}–{{ entry_max }}s remaining)</span>
+      <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#58a6ff"/></svg> c5 price (5 min before close)</span>
+      <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#e3b341"/></svg> c10 price (at entry check)</span>
+      <span><svg width="8" height="8"><polygon points="4,0 8,8 0,8" fill="#3fb950"/></svg> Trade entry (▲ YES / ▼ NO)</span>
+      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.5)" stroke-width="1" stroke-dasharray="2,4"/></svg> +{{ threshold }}¢ signal band</span>
+    </div>
   </div>
 </div>
 
+<!-- Timeline -->
+<div id="timeline-container" style="margin-bottom:1rem">
+  <div style="color:var(--dim);text-align:center;padding:2rem">Loading timeline…</div>
+</div>
+
+<!-- Trade log -->
 <div class="card" style="margin-bottom:1rem">
   <h3>Recent Trades (last 20)</h3>
-  {% if trades %}
   <table>
-    <tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th>
-        <th>Move</th><th>C5→C10</th><th>Status</th><th>P&L</th></tr>
-    {% for t in trades %}
-    <tr>
-      <td>{{ t.entry_time[11:19] }}</td>
-      <td style="font-weight:700;color:var(--orange)">{{ t.asset.upper() }}</td>
-      <td><span class="badge badge-{{ t.entry_side }}">{{ t.entry_side.upper() }}</span></td>
-      <td>{{ "%.0f"|format(t.entry_price*100) }}¢</td>
-      <td>{{ t.contracts }}</td>
-      <td style="color:{% if t.signal_move > 0 %}var(--green){% else %}var(--red){% endif %}">
-        {{ "%+.1f"|format(t.signal_move) }}¢</td>
-      <td style="font-size:.7rem;color:var(--dim)">{{ "%.0f"|format(t.c5_price) }}→{{ "%.0f"|format(t.c10_price) }}¢</td>
-      <td><span class="badge badge-{{ t.status }}">{{ t.status.upper() }}</span></td>
-      <td class="{% if t.pnl_net > 0 %}pos{% elif t.pnl_net < 0 %}neg{% endif %}">
-        {% if t.pnl_net %}${{ "%.3f"|format(t.pnl_net) }}{% else %}—{% endif %}</td>
-    </tr>
-    {% endfor %}
+    <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th><th>Move</th><th>C5→C10</th><th>Status</th><th>P&L</th></tr></thead>
+    <tbody id="trades-table"><tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">Loading…</td></tr></tbody>
   </table>
-  {% else %}
-  <div style="color:var(--dim);text-align:center;padding:1rem">No trades yet</div>
-  {% endif %}
 </div>
+
 <div style="color:var(--dim);font-size:.7rem">Auto-refresh 15s &middot; Bounce-Back v{{ version }}</div>
 </body>
 </html>"""
@@ -196,10 +513,10 @@ def index():
         version="1.0.0",
         mode=cfg.mode,
         summary=summary,
-        trades=trades,
         threshold=cfg.move_threshold,
         entry_min=cfg.entry_window_min,
         entry_max=cfg.entry_window_max,
+        lookback=cfg.lookback_secs,
         contracts=cfg.base_contracts,
         assets=', '.join(a.upper() for a, e in cfg.enabled_assets.items() if e),
         max_open=cfg.max_open_positions,
@@ -257,6 +574,14 @@ def api_trades():
         return jsonify({"trades": []})
     trades = [t.__dict__ for t in bot.trade_log.all()]
     return jsonify({"trades": trades[-50:], "summary": bot.trade_log.summary()})
+
+
+@app.route("/api/timeline")
+def api_timeline():
+    global bot
+    if not bot:
+        return jsonify({})
+    return jsonify(bot.get_timeline_data())
 
 
 @app.route("/api/health")
