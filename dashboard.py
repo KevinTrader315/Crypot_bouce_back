@@ -113,11 +113,14 @@ function drawChart(canvas, window_data, compact) {
   const c10_price   = window_data.c10_price;
   const trade       = window_data.trade;
 
-  // Y range: auto-fit with padding
+  // Y range: tight fit to actual data with small padding
   const vals = prices.map(p => p[1]);
-  let yMin = Math.max(0,  Math.floor(Math.min(...vals) - 8));
-  let yMax = Math.min(100, Math.ceil(Math.max(...vals) + 8));
-  if (yMax - yMin < 20) { yMin = Math.max(0, yMin - 5); yMax = Math.min(100, yMax + 5); }
+  const dataMin = Math.min(...vals);
+  const dataMax = Math.max(...vals);
+  const pad = Math.max((dataMax - dataMin) * 0.2, 4);  // 20% of range or min 4¢
+  let yMin = Math.max(0,   Math.floor(dataMin - pad));
+  let yMax = Math.min(100, Math.ceil(dataMax  + pad));
+  if (yMax - yMin < 12) { const mid = (yMin+yMax)/2; yMin = Math.max(0, Math.floor(mid-6)); yMax = Math.min(100, Math.ceil(mid+6)); }
 
   function xPx(s)   { return PAD.l + (s / WINDOW_SECS) * cW; }
   function yPx(c)   { return PAD.t + cH - ((c - yMin) / (yMax - yMin)) * cH; }
