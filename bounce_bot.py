@@ -58,7 +58,7 @@ ASSETS = ["btc", "eth", "sol"]
 class BounceConfig:
     """Strategy parameters."""
     # Signal
-    move_threshold: float = 8.0        # Min contract move (cents) to trigger signal
+    move_threshold: float = 12.0       # Min contract move (cents) to trigger signal (backtest: 12c reduces noise)
     entry_window_min: int = 240        # Min seconds remaining when we check (4 min)
     entry_window_max: int = 600        # Max seconds remaining when we check (10 min = 5 min into window)
     lookback_secs: int = 300           # How far back to look for the "5 min ago" price
@@ -74,9 +74,9 @@ class BounceConfig:
     poll_interval: int = 15
     log_file: str = "data/bounce_trades.jsonl"
 
-    # Assets — disable BTC until more data (52.9% WR in extreme regime); keep ETH/SOL
+    # Assets — SOL disabled (backtest: not mean-reverting, -$35 P&L vs BTC/ETH +$10)
     enabled_assets: dict = field(default_factory=lambda: {
-        "btc": True, "eth": True, "sol": True
+        "btc": True, "eth": True, "sol": False
     })
 
 
