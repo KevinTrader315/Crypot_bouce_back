@@ -384,9 +384,11 @@ class BounceBackBot:
         entry_price = signal['entry_price']
 
         # Capital guard
-        exposure = len(self.trade_log.get_open()) * self.config.base_contracts * entry_price
-        if not self.capital_guard.check(exposure, self.config.base_contracts * entry_price):
-            logger.info("%s Signal blocked by capital guard", asset.upper())
+        investment_cents = int(self.config.base_contracts * entry_price * 100)
+        exposure_cents = int(len(self.trade_log.get_open()) * self.config.base_contracts * entry_price * 100)
+        allowed, reason = self.capital_guard.check_order(investment_cents, exposure_cents)
+        if not allowed:
+            logger.info("%s Signal blocked by capital guard: %s", asset.upper(), reason)
             return
 
         market = self._get_market_for_side(event, entry_side)
