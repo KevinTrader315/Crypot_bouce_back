@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
-from bounce_bot import BounceBackBot, BounceConfig, KalshiTrader, ASSETS
+from bounce_bot import BounceBackBot, BounceConfig, KalshiTrader, ASSETS, BOT_VERSION
 
 logger = logging.getLogger("dashboard")
 
@@ -370,12 +370,14 @@ async function fetchStats() {
     const s = d.summary || {};
     const el = document.getElementById('stats-card');
     if (!el) return;
-    const wr = s.settled ? (s.win_rate*100).toFixed(1)+'% ('+s.wins+'/'+s.settled+')' : '—';
+    const closed = (s.closed||0);
+    const wr = closed ? (s.win_rate*100).toFixed(1)+'% ('+s.wins+'/'+closed+')' : '—';
     const pnl = s.total_pnl ? '$'+(s.total_pnl>=0?'+':'')+s.total_pnl.toFixed(3) : '$0.000';
     el.innerHTML = `
       <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">${s.total||0}</span></div>
       <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">${s.open||0}</span></div>
-      <div class="stat"><span class="stat-l">Settled</span><span class="stat-v">${s.settled||0}</span></div>
+      <div class="stat"><span class="stat-l">Scalp Exits</span><span class="stat-v" style="color:var(--green)">${s.scalp_exits||0}</span></div>
+      <div class="stat"><span class="stat-l">Held to Settlement</span><span class="stat-v">${s.held_to_settlement||0}</span></div>
       <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v ${s.win_rate>=0.6?'pos':s.win_rate>0&&s.win_rate<0.4?'neg':''}">${wr}</span></div>
       <div class="stat"><span class="stat-l">Total P&amp;L</span><span class="stat-v ${s.total_pnl>=0?'pos':'neg'}">${pnl}</span></div>`;
 
@@ -383,8 +385,14 @@ async function fetchStats() {
     const trades = (d.trades || []).slice(-20).reverse();
     const tbl = document.getElementById('trades-table');
     if (!tbl) return;
-    if (!trades.length) { tbl.innerHTML = '<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">No trades yet</td></tr>'; return; }
-    tbl.innerHTML = trades.map(t => `<tr>
+    if (!trades.length) { tbl.innerHTML = '<tr><td colspan="10" style="color:var(--dim);text-align:center;padding:1rem">No trades yet</td></tr>'; return; }
+    tbl.innerHTML = trades.map(t => {
+      const exitLabel = t.exit_type === 'scalp' ? `SCALP @${Math.round((t.exit_price||0)*100)}¢`
+        : t.status === 'settled' ? `SETTLE ${(t.result||'?').toUpperCase()}`
+        : t.status === 'open' ? 'MONITORING' : '—';
+      const exitColor = t.exit_type === 'scalp' ? 'var(--green)' : t.status === 'settled' ? 'var(--dim)' : 'var(--accent)';
+      const maxP = t.max_price_after_entry != null ? Math.round(t.max_price_after_entry) + '¢' : '—';
+      return `<tr>
       <td>${t.entry_time.substring(11,19)}</td>
       <td style="font-weight:700;color:var(--orange)">${t.asset.toUpperCase()}</td>
       <td><span class="badge badge-${t.entry_side}">${t.entry_side.toUpperCase()}</span></td>
@@ -392,9 +400,10 @@ async function fetchStats() {
       <td>${t.contracts}</td>
       <td style="color:${t.signal_move>0?'var(--green)':'var(--red)'}">${t.signal_move>0?'+':''}${t.signal_move.toFixed(1)}¢</td>
       <td style="font-size:.7rem;color:var(--dim)">${Math.round(t.c5_price)}→${Math.round(t.c10_price)}¢</td>
-      <td><span class="badge badge-${t.status}">${t.status.toUpperCase()}</span></td>
+      <td style="font-size:.7rem;color:${exitColor}">${exitLabel}</td>
+      <td style="font-size:.7rem">${maxP}</td>
       <td class="${t.pnl_net>0?'pos':t.pnl_net<0?'neg':''}">${t.pnl_net?'$'+t.pnl_net.toFixed(3):'—'}</td>
-    </tr>`).join('');
+    </tr>`;}).join('');
   } catch(e) {}
 }
 
@@ -481,16 +490,16 @@ function startAutoRefresh() {
     <div id="stats-card">
       <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">{{ summary.total }}</span></div>
       <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">{{ summary.open }}</span></div>
-      <div class="stat"><span class="stat-l">Settled</span><span class="stat-v">{{ summary.settled }}</span></div>
+      <div class="stat"><span class="stat-l">Scalp Exits</span><span class="stat-v" style="color:#3fb950">{{ summary.scalp_exits }}</span></div>
+      <div class="stat"><span class="stat-l">Held to Settlement</span><span class="stat-v">{{ summary.held_to_settlement }}</span></div>
       <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v">—</span></div>
       <div class="stat"><span class="stat-l">Total P&L</span><span class="stat-v">$0.000</span></div>
     </div>
   </div>
   <div class="card">
     <h3>Config</h3>
-    <div class="stat"><span class="stat-l">Signal Threshold</span><span class="stat-v">{{ threshold }}¢ move</span></div>
     <div class="stat"><span class="stat-l">Entry Window</span><span class="stat-v">{{ entry_min }}-{{ entry_max }}s remaining</span></div>
-    <div class="stat"><span class="stat-l">c5 Lookback</span><span class="stat-v">{{ lookback }}s before close</span></div>
+    <div class="stat"><span class="stat-l">S/R Filter</span><span class="stat-v" style="color:{{ 'var(--green)' if sr_enabled else 'var(--red)' }}">{{ 'ON' if sr_enabled else 'OFF' }}</span></div>
     <div class="stat">
       <span class="stat-l">Base Contracts</span>
       <span class="stat-v" style="display:flex;align-items:center;gap:.4rem">
@@ -503,6 +512,8 @@ function startAutoRefresh() {
         <span id="contractsFb" style="font-size:.7rem;color:var(--dim)"></span>
       </span>
     </div>
+    <div class="stat"><span class="stat-l">Exit Target</span><span class="stat-v">{{ exit_target }}¢</span></div>
+    <div class="stat"><span class="stat-l">Entry Range</span><span class="stat-v">{{ min_entry }}-{{ max_entry }}¢</span></div>
     <div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">{{ max_open }}</span></div>
     <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
   </div>
@@ -512,7 +523,7 @@ function startAutoRefresh() {
       <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#58a6ff"/></svg> c5 price (5 min before close)</span>
       <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#e3b341"/></svg> c10 price (at entry check)</span>
       <span><svg width="8" height="8"><polygon points="4,0 8,8 0,8" fill="#3fb950"/></svg> Trade entry (▲ YES / ▼ NO)</span>
-      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.5)" stroke-width="1" stroke-dasharray="2,4"/></svg> +{{ threshold }}¢ signal band</span>
+      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.5)" stroke-width="1" stroke-dasharray="2,4"/></svg> {{ min_entry }}-{{ max_entry }}¢ entry zone</span>
     </div>
   </div>
 </div>
@@ -526,8 +537,8 @@ function startAutoRefresh() {
 <div class="card" style="margin-bottom:1rem">
   <h3>Recent Trades (last 20)</h3>
   <table>
-    <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th><th>Move</th><th>C5→C10</th><th>Status</th><th>P&L</th></tr></thead>
-    <tbody id="trades-table"><tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">Loading…</td></tr></tbody>
+    <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th><th>Move</th><th>C5→C10</th><th>Exit</th><th>Max</th><th>P&L</th></tr></thead>
+    <tbody id="trades-table"><tr><td colspan="10" style="color:var(--dim);text-align:center;padding:1rem">Loading…</td></tr></tbody>
   </table>
 </div>
 
@@ -544,14 +555,16 @@ def index():
     cfg = bot.config if bot else BounceConfig()
     return render_template_string(
         DASHBOARD_HTML,
-        version="1.0.0",
+        version=BOT_VERSION,
         mode=cfg.mode,
         summary=summary,
-        threshold=cfg.move_threshold,
         entry_min=cfg.entry_window_min,
         entry_max=cfg.entry_window_max,
-        lookback=cfg.lookback_secs,
         contracts=cfg.base_contracts,
+        exit_target=int(cfg.exit_target * 100),
+        min_entry=int(cfg.min_entry_price * 100),
+        max_entry=int(cfg.max_entry_price * 100),
+        sr_enabled=cfg.sr_enabled,
         assets=', '.join(a.upper() for a, e in cfg.enabled_assets.items() if e),
         max_open=cfg.max_open_positions,
         poll=cfg.poll_interval,
@@ -600,7 +613,10 @@ def api_status():
         "open_trades": len(bot.trade_log.get_open()),
         # Live config — included so portal rules tab and bot dashboard stay in sync
         "base_contracts": bot.config.base_contracts,
-        "move_threshold": bot.config.move_threshold,
+        "min_entry_price": bot.config.min_entry_price,
+        "max_entry_price": bot.config.max_entry_price,
+        "sr_enabled": bot.config.sr_enabled,
+        "exit_target": bot.config.exit_target,
         "entry_window_min": bot.config.entry_window_min,
         "entry_window_max": bot.config.entry_window_max,
         "max_open_positions": bot.config.max_open_positions,
@@ -656,7 +672,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--threshold", type=float, default=8.0)
+    parser.add_argument("--exit-target", type=float, default=50.0)
+    parser.add_argument("--no-sr", action="store_true")
     parser.add_argument("--port", type=int, default=5052)
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
@@ -680,7 +697,8 @@ if __name__ == "__main__":
     config = BounceConfig(
         mode=args.mode,
         base_contracts=args.contracts,
-        move_threshold=args.threshold,
+        exit_target=args.exit_target / 100,
+        sr_enabled=not args.no_sr,
         poll_interval=args.poll,
     )
 

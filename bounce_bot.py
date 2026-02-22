@@ -2,23 +2,23 @@
 """
 Intra-Window Contract Bounce-Back Bot
 
-Strategy (validated on 193 BTC windows, Feb 18-20 2026):
-  At minute 10 of each 15-min window, if the contract moved >THRESHOLD cents
-  between minute 5 and minute 10, the move is WRONG ~69.7% of the time.
-  Bet AGAINST the move and hold 5 minutes to settlement.
+Strategy (backtested on 933 windows, Feb 2026):
+  When a contract price drops/rises significantly mid-window (between minute 5
+  and minute 10), buy the cheap side and sell at a fixed 50c exit target before
+  settlement. This is a SCALP strategy — we exit on reversion, not hold to expiry.
 
 Signal:
   contract_yes_5m → contract_yes_10m
   If delta > +THRESHOLD (contract rallied in last 5 min) → buy NO (bet it reverses)
   If delta < -THRESHOLD (contract fell in last 5 min)   → buy YES (bet it reverses)
 
-Backtest results:
-  WR: 69.7%  (n=33 BTC windows)
-  Avg entry: ~30c  EV: +$0.36/contract
-  Frequency: ~17% of windows → ~49 signals/day across BTC+ETH+SOL
+Backtest results (best configs):
+  NO side, 8c+ drop, c10<=30c, exit @50c: 61% hit, $0.17/trade
+  YES side, 20c+ drop, c10<=15c, exit @50c: 63% hit, $0.23/trade
+  Contracts 0-10c rarely bounce (14%); 10-30c is the sweet spot
 
-Entry window: when 270-330s remain (minute 9.5-10.5 of the window)
-Hold: to settlement (~5 min)
+Entry window: 4-10 min into window (240-600s remaining)
+Exit: sell at fixed 50c target, or hold to settlement if not hit
 """
 
 import argparse
@@ -43,10 +43,11 @@ from kalshi_fetcher import (
     parse_kalshi_bracket,
 )
 from capital_guard import CapitalGuard
+from support_resistance import SRTracker, fetch_spot_price
 
 logger = logging.getLogger("BounceBot")
 
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -57,24 +58,30 @@ ASSETS = ["btc", "eth", "sol"]
 @dataclass
 class BounceConfig:
     """Strategy parameters."""
-    # Signal
-    move_threshold: float = 12.0       # Min contract move (cents) to trigger signal (backtest: 12c reduces noise)
+    # Signal — entry is triggered by contract price range, NOT a move threshold
+    # The contract being at 10-30c already implies a big move happened
     entry_window_min: int = 240        # Min seconds remaining when we check (4 min)
     entry_window_max: int = 600        # Max seconds remaining when we check (10 min = 5 min into window)
-    lookback_secs: int = 300           # How far back to look for the "5 min ago" price
 
     # Entry
-    max_entry_price: float = 0.35      # Don't buy contracts already >35c (backtest avg ~30c)
-    min_entry_price: float = 0.05      # Don't buy near-zero contracts
+    max_entry_price: float = 0.30      # Don't buy contracts >30c (backtest: 10-30c is sweet spot)
+    min_entry_price: float = 0.10      # Don't buy <10c (only 14% bounce rate)
     base_contracts: int = 5            # Contracts per trade
     max_open_positions: int = 3        # Max simultaneous positions
+
+    # Support/Resistance filter — only trade when spot is at a key level
+    sr_enabled: bool = True            # Require S/R confirmation for entry
+
+    # Exit — scalp at fixed price target, don't hold to settlement
+    exit_target: float = 0.50          # Sell when contract reaches 50c (backtest best)
+    exit_poll_interval: int = 5        # Check exit price every 5 seconds
 
     # Mode
     mode: str = "paper"
     poll_interval: int = 15
     log_file: str = "data/bounce_trades.jsonl"
 
-    # Assets — SOL disabled (backtest: not mean-reverting, -$35 P&L vs BTC/ETH +$10)
+    # Assets — SOL disabled (backtest: not mean-reverting)
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": False
     })
@@ -99,10 +106,12 @@ class BounceTraide:
     c10_price: float
     entry_time: str
     close_time: str
-    status: str = "open"      # open | settled | cancelled
+    status: str = "open"      # open | exited | settled | cancelled
     exit_price: Optional[float] = None
+    exit_type: Optional[str] = None  # "scalp" (hit target) | "settlement" (held to end)
     result: Optional[str] = None
     pnl_net: float = 0.0
+    max_price_after_entry: Optional[float] = None  # highest contract price seen post-entry
     notes: str = ""
 
 
@@ -118,6 +127,10 @@ class TradeLog:
             with open(self.filepath) as f:
                 for line in f:
                     t = json.loads(line)
+                    # Handle records from before exit_type/max_price fields existed
+                    for key in ('exit_type', 'max_price_after_entry'):
+                        if key not in t:
+                            t[key] = None
                     self._trades[t['trade_id']] = BounceTraide(**t)
         except FileNotFoundError:
             pass
@@ -136,15 +149,19 @@ class TradeLog:
         return list(self._trades.values())
 
     def summary(self) -> dict:
-        settled = [t for t in self._trades.values() if t.status == 'settled']
-        wins = [t for t in settled if t.pnl_net > 0]
+        closed = [t for t in self._trades.values() if t.status in ('settled', 'exited')]
+        scalps = [t for t in closed if t.exit_type == 'scalp']
+        settlements = [t for t in closed if t.exit_type != 'scalp']
+        wins = [t for t in closed if t.pnl_net > 0]
         return {
             'total': len(self._trades),
             'open': len(self.get_open()),
-            'settled': len(settled),
+            'closed': len(closed),
+            'scalp_exits': len(scalps),
+            'held_to_settlement': len(settlements),
             'wins': len(wins),
-            'win_rate': len(wins) / len(settled) if settled else 0,
-            'total_pnl': sum(t.pnl_net for t in settled),
+            'win_rate': len(wins) / len(closed) if closed else 0,
+            'total_pnl': sum(t.pnl_net for t in closed),
         }
 
 
@@ -259,10 +276,13 @@ class BounceBackBot:
         self.trade_log = TradeLog(config.log_file)
         self.price_cache = PriceCache()
         self.capital_guard = CapitalGuard("bounce-back")
+        self.sr_tracker = SRTracker(
+            assets=[a for a, e in config.enabled_assets.items() if e])
         self.running = False
         self.trading_enabled = True          # toggle via dashboard to pause entries
         self._entered_windows: set = set()  # prevent double-entry per window
-        self._stats = {'signals': 0, 'trades': 0, 'skipped': 0}
+        self._stats = {'signals': 0, 'trades': 0, 'skipped': 0,
+                       'sr_blocked': 0, 'sr_passed': 0}
         # event_ticker -> {asset, close_time_ts, close_time_str, window_start_ts}
         self._window_meta: dict[str, dict] = {}
 
@@ -324,54 +344,60 @@ class BounceBackBot:
     # ------------------------------------------------------------------
 
     def _check_signal(self, asset: str, event: dict) -> Optional[dict]:
-        """Check if the bounce-back signal is present."""
-        event_ticker = event['event_ticker']
-        close_ts = event['close_ts']
+        """Check if the bounce-back signal is present.
 
-        # Price now
-        now_ts = time.time()
+        Signal logic:
+          1. Contract YES price is in the 10-30c range → cheap side is YES
+             OR contract YES price is in the 70-90c range → cheap side is NO
+          2. Spot price is near a support (for YES) or resistance (for NO)
+        """
+        event_ticker = event['event_ticker']
+
+        # Current contract price
         now_price = self.price_cache.latest(event_ticker)
         if now_price is None:
             return None
 
-        # Price ~5 minutes ago relative to NOW (works at any point in the window)
-        target_5m_ago = now_ts - self.config.lookback_secs
-        price_5m_ago = self.price_cache.price_at(event_ticker, target_5m_ago)
-        if price_5m_ago is None:
-            return None
+        min_cents = self.config.min_entry_price * 100
+        max_cents = self.config.max_entry_price * 100
 
-        move = now_price - price_5m_ago  # positive = contract moved toward YES
-
-        if abs(move) < self.config.move_threshold:
-            return None
-
-        # Signal: bet AGAINST the move
-        if move > 0:
-            entry_side = 'no'   # contract rallied → bet NO (reversal)
-            entry_price = (100 - now_price) / 100  # no_ask ≈ 100 - yes_bid
+        # Determine which side is cheap
+        if min_cents <= now_price <= max_cents:
+            # YES is cheap (10-30c) → buy YES, expecting bounce up
+            entry_side = 'yes'
+            entry_price = now_price / 100
+        elif (100 - max_cents) <= now_price <= (100 - min_cents):
+            # NO is cheap (YES is 70-90c) → buy NO, expecting YES to drop
+            entry_side = 'no'
+            entry_price = (100 - now_price) / 100
         else:
-            entry_side = 'yes'  # contract fell → bet YES (reversal)
-            entry_price = now_price / 100  # yes_ask
+            # Contract price not in our target range
+            return None
 
-        # Price guards
-        if entry_price > self.config.max_entry_price:
-            logger.debug("%s signal but entry %.0fc > max %.0fc, skip",
-                         asset.upper(), entry_price*100, self.config.max_entry_price*100)
-            return None
-        if entry_price < self.config.min_entry_price:
-            logger.debug("%s signal but entry %.0fc < min %.0fc, skip",
-                         asset.upper(), entry_price*100, self.config.min_entry_price*100)
-            return None
+        # S/R filter: only trade when spot is at a key level
+        sr_level = None
+        spot_price = None
+        if self.config.sr_enabled:
+            at_level, sr_level, spot_price = self.sr_tracker.check_bounce_signal(
+                asset, entry_side)
+            if not at_level:
+                logger.debug("%s contract at %.0fc (%s) but spot not at S/R, skip",
+                             asset.upper(), now_price, entry_side.upper())
+                self._stats['sr_blocked'] += 1
+                return None
+            self._stats['sr_passed'] += 1
 
         return {
             'asset': asset,
             'event_ticker': event_ticker,
             'entry_side': entry_side,
             'entry_price': entry_price,
-            'signal_move': move,
-            'c5_price': price_5m_ago,
+            'signal_move': now_price if entry_side == 'yes' else -(100 - now_price),
+            'c5_price': 0,  # not used in new logic
             'c10_price': now_price,
             'secs_left': event['secs_left'],
+            'sr_level': sr_level,
+            'spot_price': spot_price,
         }
 
     # ------------------------------------------------------------------
@@ -405,13 +431,15 @@ class BounceBackBot:
             if not order_id:
                 logger.error("%s Order placement failed", asset.upper())
                 return
-            logger.info("%s LIVE BUY %s %dx @%.0fc (move=%.1fc, %ds left)",
+            logger.info("%s LIVE BUY %s %dx @%.0fc (move=%.1fc, %ds left) → exit target %.0fc",
                         asset.upper(), entry_side.upper(), contracts,
-                        entry_price*100, signal['signal_move'], int(signal['secs_left']))
+                        entry_price*100, signal['signal_move'], int(signal['secs_left']),
+                        self.config.exit_target*100)
         else:
-            logger.info("%s PAPER BUY %s %dx @%.0fc (move=%.1fc, %ds left)",
+            logger.info("%s PAPER BUY %s %dx @%.0fc (move=%.1fc, %ds left) → exit target %.0fc",
                         asset.upper(), entry_side.upper(), contracts,
-                        entry_price*100, signal['signal_move'], int(signal['secs_left']))
+                        entry_price*100, signal['signal_move'], int(signal['secs_left']),
+                        self.config.exit_target*100)
 
         trade = BounceTraide(
             trade_id=trade_id,
@@ -433,12 +461,124 @@ class BounceBackBot:
         self._stats['trades'] += 1
         self._stats['signals'] += 1
 
+        # Spawn exit monitor thread to watch for scalp exit
+        t = threading.Thread(
+            target=self._monitor_exit, args=(trade,),
+            daemon=True, name=f"exit-{trade_id}"
+        )
+        t.start()
+
+    # ------------------------------------------------------------------
+    # Exit monitoring — scalp at target price
+    # ------------------------------------------------------------------
+
+    def _monitor_exit(self, trade: BounceTraide):
+        """Monitor an open trade and exit when price hits the target.
+
+        Runs in its own thread. Polls the contract price every exit_poll_interval
+        seconds until either:
+          1. Price hits exit_target → sell (scalp exit)
+          2. Window closes → hold to settlement (fallback)
+        """
+        try:
+            close_ts = datetime.fromisoformat(
+                trade.close_time.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            return
+
+        exit_target_cents = self.config.exit_target * 100  # e.g. 50c
+        max_price = trade.entry_price * 100  # track in cents
+
+        while time.time() < close_ts - 5:  # stop 5s before close
+            time.sleep(self.config.exit_poll_interval)
+
+            # Get current contract price
+            current_price = self.price_cache.latest(trade.event_ticker)
+            if current_price is None:
+                continue
+
+            # For NO-side trades, our profit is when YES drops (NO price = 100 - YES)
+            if trade.entry_side == 'no':
+                our_price = 100 - current_price  # NO mid price in cents
+            else:
+                our_price = current_price  # YES mid price in cents
+
+            max_price = max(max_price, our_price)
+
+            # Check if exit target hit
+            if our_price >= exit_target_cents:
+                exit_price_frac = our_price / 100
+                fee = kalshi_fee(trade.entry_price)
+                trade.pnl_net = (exit_price_frac - trade.entry_price - fee) * trade.contracts
+                trade.exit_price = exit_price_frac
+                trade.exit_type = 'scalp'
+                trade.status = 'exited'
+                trade.max_price_after_entry = max_price
+                trade.notes = f'scalp_exit@{our_price:.0f}c'
+
+                if self.config.mode == 'live' and self.trader:
+                    # Place sell order
+                    sell_side = trade.entry_side
+                    sell_price = int(our_price)
+                    order_id = self.trader.place_order(
+                        trade.ticker, sell_side, trade.contracts,
+                        exit_price_frac)
+                    if order_id:
+                        trade.notes += f' order={order_id}'
+                    else:
+                        trade.notes += ' sell_order_failed'
+                        logger.error("%s SELL ORDER FAILED @%.0fc",
+                                     trade.asset.upper(), our_price)
+
+                self.trade_log.save(trade)
+                logger.info(
+                    "%s %s EXIT @%.0fc (entry=%.0fc, +%.0fc) P&L=$%.3f  max=%.0fc",
+                    trade.asset.upper(),
+                    "LIVE" if self.config.mode == 'live' else "PAPER",
+                    our_price, trade.entry_price * 100,
+                    our_price - trade.entry_price * 100,
+                    trade.pnl_net, max_price
+                )
+                return
+
+        # Window closing without hitting target — record max price seen
+        trade.max_price_after_entry = max_price
+        trade.notes = f'no_exit_hit max={max_price:.0f}c target={exit_target_cents:.0f}c'
+        self.trade_log.save(trade)
+        logger.info(
+            "%s EXIT TARGET NOT HIT (target=%.0fc, max=%.0fc, entry=%.0fc) → holding to settlement",
+            trade.asset.upper(), exit_target_cents, max_price,
+            trade.entry_price * 100
+        )
+
+    # ------------------------------------------------------------------
+    # Price analysis helpers
+    # ------------------------------------------------------------------
+
+    def _get_price_high(self, event_ticker: str, entry_time_str: str) -> Optional[float]:
+        """Get the highest YES price after entry time (for scalp analysis)."""
+        try:
+            entry_ts = datetime.fromisoformat(
+                entry_time_str.replace('Z', '+00:00')).timestamp()
+        except Exception:
+            return None
+        with self.price_cache._lock:
+            entries = list(self.price_cache._data.get(event_ticker, []))
+        if not entries:
+            return None
+        post_entry = [price for ts, price in entries if ts >= entry_ts]
+        return max(post_entry) if post_entry else None
+
     # ------------------------------------------------------------------
     # Settlement checking
     # ------------------------------------------------------------------
 
     def _check_settlements(self):
-        """Check open trades and settle any that have closed."""
+        """Check open trades and settle any that have closed.
+
+        Trades that already exited via scalp (status='exited') are skipped.
+        Only 'open' trades that missed the exit target get settled here.
+        """
         open_trades = self.trade_log.get_open()
         if not open_trades:
             return
@@ -491,25 +631,39 @@ class BounceBackBot:
                     # Use price cache to infer result
                     final_price = self.price_cache.latest(trade.event_ticker)
                     if final_price is not None:
-                        if final_price > 90:
+                        if final_price > 50:
                             inferred = 'yes'
-                        elif final_price < 10:
-                            inferred = 'no'
                         else:
-                            inferred = None
-                        if inferred:
-                            won = (inferred == trade.entry_side)
-                            payout = 1.0 if won else 0.0
-                            fee = kalshi_fee(trade.entry_price)
-                            trade.pnl_net = (payout - trade.entry_price - fee) * trade.contracts
-                            trade.result = inferred
-                            trade.status = 'settled'
-                            trade.notes = 'inferred_from_price'
-                            self.trade_log.save(trade)
-                            logger.info(
-                                "%s PAPER SETTLED (inferred %s) P&L=$%.3f",
-                                trade.asset.upper(), inferred.upper(), trade.pnl_net
-                            )
+                            inferred = 'no'
+                        won = (inferred == trade.entry_side)
+                        payout = 1.0 if won else 0.0
+                        fee = kalshi_fee(trade.entry_price)
+                        trade.pnl_net = (payout - trade.entry_price - fee) * trade.contracts
+                        trade.result = inferred
+                        trade.status = 'settled'
+                        trade.notes = f'inferred_from_price={final_price:.1f}c'
+                        # Also record the max price seen during the window for scalp analysis
+                        price_high = self._get_price_high(trade.event_ticker, trade.entry_time)
+                        if price_high is not None:
+                            trade.notes += f' high={price_high:.1f}c'
+                        self.trade_log.save(trade)
+                        logger.info(
+                            "%s PAPER SETTLED (inferred %s, last=%.0fc, high=%s) P&L=$%.3f",
+                            trade.asset.upper(), inferred.upper(), final_price,
+                            f"{price_high:.0f}c" if price_high else "?",
+                            trade.pnl_net
+                        )
+                    else:
+                        # No cached price — mark as expired with unknown result
+                        trade.status = 'settled'
+                        trade.result = 'unknown'
+                        trade.pnl_net = -trade.entry_price * trade.contracts  # assume loss
+                        trade.notes = 'no_cached_price'
+                        self.trade_log.save(trade)
+                        logger.info(
+                            "%s PAPER SETTLED (no price data, assumed loss) P&L=$%.3f",
+                            trade.asset.upper(), trade.pnl_net
+                        )
             except Exception as e:
                 logger.debug("Settlement check error %s: %s", trade.trade_id, e)
 
@@ -520,6 +674,10 @@ class BounceBackBot:
     def run_once(self):
         """One poll cycle — fetch prices, check signal, settle."""
         self._check_settlements()
+
+        # Refresh S/R levels periodically (every 15 min)
+        if self.config.sr_enabled:
+            self.sr_tracker.refresh()
 
         # Clean up entered_windows for events that have closed
         now = time.time()
@@ -575,11 +733,17 @@ class BounceBackBot:
             if signal is None:
                 continue
 
+            sr_info = ""
+            if signal.get('sr_level'):
+                lvl = signal['sr_level']
+                sr_info = f" S/R={lvl.type}@${lvl.price:.0f}({lvl.source},str={lvl.strength})"
+            spot_info = f" spot=${signal['spot_price']:.2f}" if signal.get('spot_price') else ""
             logger.info(
-                "%s SIGNAL: c5=%.0fc c10=%.0fc move=%.1fc → BUY %s  %ds left",
-                asset.upper(), signal['c5_price'], signal['c10_price'],
-                signal['signal_move'], signal['entry_side'].upper(),
-                int(signal['secs_left'])
+                "%s SIGNAL: contract=%.0fc → BUY %s  %ds left%s%s",
+                asset.upper(), signal['c10_price'],
+                signal['entry_side'].upper(),
+                int(signal['secs_left']),
+                spot_info, sr_info
             )
             if not self.trading_enabled:
                 logger.info("%s Trading paused — signal skipped", asset.upper())
@@ -636,9 +800,9 @@ class BounceBackBot:
                     continue
 
                 # Entry window bounds in elapsed seconds
-                entry_start_s = 900 - self.config.entry_window_max  # 540
-                entry_end_s   = 900 - self.config.entry_window_min  # 660
-                c5_ref_s      = 900 - self.config.lookback_secs      # 600
+                entry_start_s = 900 - self.config.entry_window_max  # 300 (5 min in)
+                entry_end_s   = 900 - self.config.entry_window_min  # 660 (11 min in)
+                c5_ref_s      = 300  # 5 min into window
 
                 # Find c5 and c10 prices from the price series
                 def price_at_elapsed(target_s, tol=45):
@@ -675,7 +839,8 @@ class BounceBackBot:
                     'c5_ref_s': c5_ref_s,
                     'c5_price': c5_price,
                     'c10_price': c10_price,
-                    'threshold': self.config.move_threshold,
+                    'entry_zone_min': self.config.min_entry_price * 100,
+                    'entry_zone_max': self.config.max_entry_price * 100,
                     'trade': trade_info,
                 }
 
@@ -696,11 +861,18 @@ class BounceBackBot:
     def run(self):
         self.running = True
         logger.info("Bounce-Back Bot v%s started (%s mode)", BOT_VERSION, self.config.mode)
-        logger.info("Assets: %s  Threshold: %.0fc  Entry window: %d-%ds",
+        logger.info("Assets: %s  Entry: %.0f-%.0fc  Exit target: %.0fc  S/R: %s  Window: %d-%ds",
                     [a for a, e in self.config.enabled_assets.items() if e],
-                    self.config.move_threshold,
+                    self.config.min_entry_price * 100,
+                    self.config.max_entry_price * 100,
+                    self.config.exit_target * 100,
+                    "ON" if self.config.sr_enabled else "OFF",
                     self.config.entry_window_min,
                     self.config.entry_window_max)
+        # Initial S/R level load
+        if self.config.sr_enabled:
+            logger.info("Loading S/R levels...")
+            self.sr_tracker.refresh(force=True)
         while self.running:
             try:
                 self.run_once()
@@ -717,8 +889,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bounce-Back Bot")
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--threshold", type=float, default=8.0,
-                        help="Min contract move in cents to trigger signal")
+    parser.add_argument("--exit-target", type=float, default=50.0,
+                        help="Exit target price in cents (sell when contract reaches this)")
+    parser.add_argument("--no-sr", action="store_true",
+                        help="Disable S/R filter (trade on price range only)")
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
 
@@ -742,7 +916,8 @@ if __name__ == "__main__":
     config = BounceConfig(
         mode=args.mode,
         base_contracts=args.contracts,
-        move_threshold=args.threshold,
+        exit_target=args.exit_target / 100,  # CLI takes cents, config stores fraction
+        sr_enabled=not args.no_sr,
         poll_interval=args.poll,
     )
 
