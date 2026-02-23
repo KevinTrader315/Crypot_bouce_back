@@ -8,21 +8,20 @@ if [ -n "$KALSHI_PRIVATE_KEY" ]; then
     export KALSHI_PRIVATE_KEY_PATH=/app/kalshi_key.pem
 fi
 
-SR_FLAG=""
-if [ "${DISABLE_SR:-}" = "true" ]; then
-    SR_FLAG="--no-sr"
+CONV_FLAG=""
+if [ -n "${MIN_CONVICTION:-}" ]; then
+    CONV_FLAG="--min-conviction ${MIN_CONVICTION}"
 fi
 
-CONF_FLAG=""
-if [ "${REQUIRE_CONFIRMATION:-}" = "true" ]; then
-    CONF_FLAG="--require-confirmation"
+SL_FLAG=""
+if [ "${DISABLE_STOP_LOSS:-}" = "true" ]; then
+    SL_FLAG="--no-stop-loss"
 fi
 
 exec python3 dashboard.py \
   --mode "${BOT_MODE:-paper}" \
   --contracts "${CONTRACTS:-5}" \
-  --exit-target "${EXIT_TARGET:-50}" \
   --port 5052 \
   --poll "${POLL_INTERVAL:-15}" \
-  $SR_FLAG \
-  $CONF_FLAG
+  $CONV_FLAG \
+  $SL_FLAG

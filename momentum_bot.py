@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-Intra-Window Contract Bounce-Back Bot
+Momentum Continuation Bot v3.0
 
-Strategy (backtested on 933 windows, Feb 2026):
-  When a contract price drops/rises significantly mid-window (between minute 5
-  and minute 10), buy the cheap side and sell at a fixed 50c exit target before
-  settlement. This is a SCALP strategy — we exit on reversion, not hold to expiry.
+Strategy (discovered via signal analysis on 16,639 windows, Feb 2026):
+  At minute 7-10 of a 15-min window, compute a 4-signal conviction score.
+  If 3+ signals agree on a direction, buy that side's contract (45-78c range).
+  Hold to settlement. Stop-loss if conviction collapses AND price drops 15c.
 
-Signal:
-  contract_yes_5m → contract_yes_10m
-  If delta > +THRESHOLD (contract rallied in last 5 min) → buy NO (bet it reverses)
-  If delta < -THRESHOLD (contract fell in last 5 min)   → buy YES (bet it reverses)
+Signal conviction (4 signals):
+  1. first_5m_dir — spot direction in first 5 minutes
+  2. first_5m_ofi — order flow imbalance in first 5 minutes
+  3. mid_dir — spot direction at mid-window (5-10 min)
+  4. taker_buy_ratio — ratio of aggressive buyers vs sellers
 
-Backtest results (best configs):
-  NO side, 8c+ drop, c10<=30c, exit @50c: 61% hit, $0.17/trade
-  YES side, 20c+ drop, c10<=15c, exit @50c: 63% hit, $0.23/trade
-  Contracts 0-10c rarely bounce (14%); 10-30c is the sweet spot
-
-Entry window: 4-10 min into window (240-600s remaining)
-Exit: sell at fixed 50c target, or hold to settlement if not hit
+Win rates from signal discovery:
+  - 4/4 conviction: 77.8% WR, +27.8% edge (N=1292)
+  - 3/4 conviction: ~65% WR, ~+15% edge
 """
 
 import argparse
@@ -43,11 +40,11 @@ from kalshi_fetcher import (
     parse_kalshi_bracket,
 )
 from capital_guard import CapitalGuard
-from support_resistance import SRTracker, ConfirmationResult, fetch_spot_price
+from momentum_signals import MomentumTracker, MomentumSignal, fetch_spot_price
 
-logger = logging.getLogger("BounceBot")
+logger = logging.getLogger("MomentumBot")
 
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "3.0.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -55,89 +52,64 @@ BOT_VERSION = "2.1.0"
 
 ASSETS = ["btc", "eth", "sol"]
 
+
 @dataclass
-class BounceConfig:
+class MomentumConfig:
     """Strategy parameters."""
-    # Signal — entry is triggered by contract price range, NOT a move threshold
-    # The contract being at 10-30c already implies a big move happened
-    entry_window_min: int = 240        # Min seconds remaining when we check (4 min)
-    entry_window_max: int = 600        # Max seconds remaining when we check (10 min = 5 min into window)
-
-    # Entry
-    max_entry_price: float = 0.30      # Don't buy contracts >30c (backtest: 10-30c is sweet spot)
-    min_entry_price: float = 0.10      # Don't buy <10c (only 14% bounce rate)
-    base_contracts: int = 5            # Contracts per trade
-    max_open_positions: int = 3        # Max simultaneous positions
-
-    # Support/Resistance filter — only trade when spot is at a key level
-    sr_enabled: bool = True            # Require S/R confirmation for entry
-
-    # Confirmation signals — from V2 backtest (RSI, BB, rejection wick)
-    require_confirmation: bool = False  # If True, need at least 1 confirmation to trade
-    log_confirmations: bool = True      # Log confirmation details for analysis
-
-    # Exit — scalp at fixed price target, don't hold to settlement
-    exit_target: float = 0.50          # Sell when contract reaches 50c (backtest best)
-    exit_poll_interval: int = 5        # Check exit price every 5 seconds
-
-    # Mode
+    eval_window_min: int = 300     # Start checking at 300s remaining (10 min in)
+    eval_window_max: int = 480     # Last check at 480s remaining (7 min in)
+    min_conviction: int = 3        # Minimum conviction to trade (3 or 4 out of 4)
+    min_entry_price: float = 0.45  # Don't buy below 45c (too cheap = low conviction)
+    max_entry_price: float = 0.78  # Don't buy above 78c (too expensive, bad risk/reward)
+    base_contracts: int = 5
+    max_open_positions: int = 3
+    stop_loss_enabled: bool = True
+    stop_loss_threshold: float = 0.15  # Exit if price drops 15c AND conviction <=1
+    time_exit_secs: int = 120      # Exit at 2 min remaining if losing
+    time_exit_loss: float = 0.10   # Only time-exit if down >=10c
     mode: str = "paper"
     poll_interval: int = 15
-    log_file: str = "data/bounce_trades.jsonl"
-
-    # Assets — all enabled (V2 backtest: ETH best, BTC solid, SOL marginal)
+    log_file: str = "data/momentum_trades.jsonl"
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": False
     })
 
 
 # ---------------------------------------------------------------------------
-# Trade log
+# Trade record
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BounceTraide:
+class MomentumTrade:
     """Single trade record."""
     trade_id: str
     asset: str
     event_ticker: str
     ticker: str
     entry_side: str           # "yes" or "no"
-    entry_price: float
+    entry_price: float        # 0.45-0.78 range (expensive side)
     contracts: int
-    signal_move: float        # c10 - c5 (cents) that triggered this
-    c5_price: float
-    c10_price: float
+    conviction: int           # 3 or 4
+    f5m_dir: str
+    f5m_ofi: float
+    mid_dir: str
+    taker_buy_ratio: float
+    bb_z: float
+    rsi: float
     entry_time: str
     close_time: str
-    status: str = "open"      # open | exited | settled | cancelled
+    status: str = "open"      # open | exited | settled
     exit_price: Optional[float] = None
-    exit_type: Optional[str] = None  # "scalp" (hit target) | "settlement" (held to end)
+    exit_type: Optional[str] = None  # "settlement" | "stop_loss" | "time_exit"
     result: Optional[str] = None
     pnl_net: float = 0.0
-    max_price_after_entry: Optional[float] = None  # highest contract price seen post-entry
-    # Confirmation signals at entry
-    rsi: Optional[float] = None
-    rsi_confirms: bool = False
-    bb_zscore: Optional[float] = None
-    bb_confirms: bool = False
-    rejection_wick: bool = False
-    fvg_confirms: bool = False
-    fvg_direction: str = ""
-    fvg_gap_pct: float = 0.0
-    n_confirmations: int = 0
-    # S/R level details
-    sr_price: Optional[float] = None
-    sr_strength: Optional[float] = None
-    sr_touches: Optional[int] = None
-    sr_timeframe: Optional[str] = None
     notes: str = ""
 
 
 class TradeLog:
     def __init__(self, filepath: str):
         self.filepath = filepath
-        self._trades: dict[str, BounceTraide] = {}
+        self._trades: dict[str, MomentumTrade] = {}
         self._lock = threading.Lock()
         self._load()
 
@@ -146,52 +118,55 @@ class TradeLog:
             with open(self.filepath) as f:
                 for line in f:
                     t = json.loads(line)
-                    # Handle records from before new fields existed
                     defaults = {
-                        'exit_type': None, 'max_price_after_entry': None,
-                        'rsi': None, 'rsi_confirms': False,
-                        'bb_zscore': None, 'bb_confirms': False,
-                        'rejection_wick': False,
-                        'fvg_confirms': False, 'fvg_direction': '',
-                        'fvg_gap_pct': 0.0,
-                        'n_confirmations': 0,
-                        'sr_price': None, 'sr_strength': None,
-                        'sr_touches': None, 'sr_timeframe': None,
+                        'exit_type': None, 'exit_price': None,
+                        'result': None, 'pnl_net': 0.0, 'notes': '',
+                        'conviction': 0, 'f5m_dir': '', 'f5m_ofi': 0.0,
+                        'mid_dir': '', 'taker_buy_ratio': 0.5,
+                        'bb_z': 0.0, 'rsi': 50.0,
                     }
                     for key, default in defaults.items():
                         if key not in t:
                             t[key] = default
-                    self._trades[t['trade_id']] = BounceTraide(**t)
+                    self._trades[t['trade_id']] = MomentumTrade(**t)
         except FileNotFoundError:
             pass
 
-    def save(self, trade: BounceTraide):
+    def save(self, trade: MomentumTrade):
         with self._lock:
             self._trades[trade.trade_id] = trade
             with open(self.filepath, 'w') as f:
                 for t in self._trades.values():
                     f.write(json.dumps(asdict(t)) + '\n')
 
-    def get_open(self) -> list[BounceTraide]:
+    def get_open(self) -> list[MomentumTrade]:
         return [t for t in self._trades.values() if t.status == 'open']
 
-    def all(self) -> list[BounceTraide]:
+    def all(self) -> list[MomentumTrade]:
         return list(self._trades.values())
 
     def summary(self) -> dict:
         closed = [t for t in self._trades.values() if t.status in ('settled', 'exited')]
-        scalps = [t for t in closed if t.exit_type == 'scalp']
-        settlements = [t for t in closed if t.exit_type != 'scalp']
         wins = [t for t in closed if t.pnl_net > 0]
+        conv4 = [t for t in closed if t.conviction == 4]
+        conv3 = [t for t in closed if t.conviction == 3]
+        stop_losses = [t for t in closed if t.exit_type == 'stop_loss']
+        time_exits = [t for t in closed if t.exit_type == 'time_exit']
+        settlements = [t for t in closed if t.exit_type in ('settlement', None)]
         return {
             'total': len(self._trades),
             'open': len(self.get_open()),
             'closed': len(closed),
-            'scalp_exits': len(scalps),
-            'held_to_settlement': len(settlements),
             'wins': len(wins),
             'win_rate': len(wins) / len(closed) if closed else 0,
             'total_pnl': sum(t.pnl_net for t in closed),
+            'conv_4': len(conv4),
+            'conv_3': len(conv3),
+            'conv_4_wr': len([t for t in conv4 if t.pnl_net > 0]) / len(conv4) if conv4 else 0,
+            'conv_3_wr': len([t for t in conv3 if t.pnl_net > 0]) / len(conv3) if conv3 else 0,
+            'stop_losses': len(stop_losses),
+            'time_exits': len(time_exits),
+            'settlements': len(settlements),
         }
 
 
@@ -242,9 +217,34 @@ class KalshiTrader:
             logger.error("Order error: %s", e)
         return None
 
+    def sell_position(self, ticker: str, side: str, contracts: int,
+                      price: float) -> Optional[str]:
+        """Sell (close) a position. Returns order_id or None."""
+        path = "/trade-api/v2/portfolio/orders"
+        body = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": side,
+            "type": "limit",
+            "count": contracts,
+            "yes_price": int(price * 100) if side == "yes" else int((1-price) * 100),
+        }
+        try:
+            resp = self.session.post(
+                f"{KALSHI_API}/portfolio/orders",
+                headers=self._headers("POST", path),
+                json=body, timeout=10
+            )
+            if resp.status_code in (200, 201):
+                return resp.json().get('order', {}).get('order_id')
+            logger.error("Sell order failed: %d %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.error("Sell error: %s", e)
+        return None
+
     def get_fills(self, ticker: str) -> list[dict]:
         try:
-            path = f"/trade-api/v2/portfolio/fills"
+            path = "/trade-api/v2/portfolio/fills"
             resp = self.session.get(
                 f"{KALSHI_API}/portfolio/fills",
                 headers=self._headers("GET", path),
@@ -299,20 +299,20 @@ def kalshi_fee(price: float) -> float:
     return min(0.07 * min(price, 1.0 - price), 0.035)
 
 
-class BounceBackBot:
-    def __init__(self, config: BounceConfig, trader: Optional[KalshiTrader] = None):
+class MomentumBot:
+    def __init__(self, config: MomentumConfig, trader: Optional[KalshiTrader] = None):
         self.config = config
         self.trader = trader
         self.trade_log = TradeLog(config.log_file)
         self.price_cache = PriceCache()
         self.capital_guard = CapitalGuard("bounce-back")
-        self.sr_tracker = SRTracker(
+        self.momentum_tracker = MomentumTracker(
             assets=[a for a, e in config.enabled_assets.items() if e])
         self.running = False
         self.trading_enabled = True          # toggle via dashboard to pause entries
-        self._entered_windows: set = set()  # prevent double-entry per window
+        self._entered_windows: set = set()   # prevent double-entry per window
         self._stats = {'signals': 0, 'trades': 0, 'skipped': 0,
-                       'sr_blocked': 0, 'sr_passed': 0}
+                       'conv_3': 0, 'conv_4': 0}
         # event_ticker -> {asset, close_time_ts, close_time_str, window_start_ts}
         self._window_meta: dict[str, dict] = {}
 
@@ -347,7 +347,7 @@ class BounceBackBot:
             except Exception:
                 continue
             secs_left = close_ts - now
-            if self.config.entry_window_min <= secs_left <= self.config.entry_window_max:
+            if self.config.eval_window_min <= secs_left <= self.config.eval_window_max:
                 if et not in events:
                     events[et] = {'event_ticker': et, 'close_ts': close_ts,
                                   'secs_left': secs_left, 'markets': []}
@@ -374,84 +374,73 @@ class BounceBackBot:
     # ------------------------------------------------------------------
 
     def _check_signal(self, asset: str, event: dict) -> Optional[dict]:
-        """Check if the bounce-back signal is present.
+        """Check if momentum continuation signal is present.
 
         Signal logic:
-          1. Contract YES price is in the 10-30c range → cheap side is YES
-             OR contract YES price is in the 70-90c range → cheap side is NO
-          2. Spot price is near a support (for YES) or resistance (for NO)
-          3. (Optional) Confirmation signals: RSI extreme, BB z-score, rejection wick
+          1. Refresh spot data and record spot tick for this window
+          2. Compute 4-signal conviction at 7-10 min into window
+          3. If conviction >= min_conviction, check contract price is in 45-78c range
         """
         event_ticker = event['event_ticker']
+        close_ts = event['close_ts']
+        window_open_ts = close_ts - 900  # 15-min window
+        now_ts = time.time()
 
-        # Current contract price
+        # Refresh spot data
+        self.momentum_tracker.refresh(asset)
+        spot = self.momentum_tracker.get_spot(asset)
+        if spot:
+            self.momentum_tracker.record_spot(asset, spot, now_ts)
+
+        # Compute momentum signal
+        signal = self.momentum_tracker.compute_signal(
+            asset, window_open_ts, now_ts)
+
+        if signal.direction == "none":
+            return None
+
+        if signal.conviction < self.config.min_conviction:
+            return None
+
+        self._stats['signals'] += 1
+
+        # Get current contract YES mid price
         now_price = self.price_cache.latest(event_ticker)
         if now_price is None:
             return None
 
+        # Determine entry side and check price range
+        entry_side = signal.direction
         min_cents = self.config.min_entry_price * 100
         max_cents = self.config.max_entry_price * 100
 
-        # Determine which side is cheap
-        if min_cents <= now_price <= max_cents:
-            entry_side = 'yes'
-            entry_price = now_price / 100
-            direction = 'up'       # YES cheap = price dropped, expect bounce up
-        elif (100 - max_cents) <= now_price <= (100 - min_cents):
-            entry_side = 'no'
-            entry_price = (100 - now_price) / 100
-            direction = 'down'     # NO cheap = price rallied, expect drop
-        else:
-            return None
-
-        # S/R filter
-        sr_level = None
-        spot_price = None
-        if self.config.sr_enabled:
-            at_level, sr_level, spot_price = self.sr_tracker.check_bounce_signal(
-                asset, entry_side)
-            if not at_level:
-                logger.debug("%s contract at %.0fc (%s) but spot not at S/R, skip",
-                             asset.upper(), now_price, entry_side.upper())
-                self._stats['sr_blocked'] += 1
+        if entry_side == 'yes':
+            # Buy YES — check YES price is in 45-78c range
+            if not (min_cents <= now_price <= max_cents):
+                logger.debug("%s Conv %d/4 YES but price %.0fc outside %.0f-%.0fc",
+                             asset.upper(), signal.conviction,
+                             now_price, min_cents, max_cents)
                 return None
-            self._stats['sr_passed'] += 1
-
-        # Confirmation signals (RSI, BB, rejection wick)
-        confirmations = self.sr_tracker.check_confirmations(asset, direction)
-
-        if self.config.log_confirmations:
-            logger.debug(
-                "%s Confirmations: RSI=%.1f(%s) BB=%.2f(%s) Wick=%s FVG=%s → %d/4",
-                asset.upper(), confirmations.rsi,
-                "✓" if confirmations.rsi_confirms else "✗",
-                confirmations.bb_zscore,
-                "✓" if confirmations.bb_confirms else "✗",
-                "✓" if confirmations.rejection_wick else "✗",
-                f"✓ {confirmations.fvg_direction} {confirmations.fvg_gap_pct:.3%}" if confirmations.fvg_confirms else "✗",
-                confirmations.n_confirmations,
-            )
-
-        # Optional: require at least 1 confirmation
-        if self.config.require_confirmation and confirmations.n_confirmations < 1:
-            logger.debug("%s No confirmations, skip (require_confirmation=True)",
-                         asset.upper())
-            self._stats['sr_blocked'] += 1
-            return None
+            entry_price = now_price / 100
+        else:
+            # Buy NO — check NO price (100 - YES) is in 45-78c range
+            no_price = 100 - now_price
+            if not (min_cents <= no_price <= max_cents):
+                logger.debug("%s Conv %d/4 NO but price %.0fc outside %.0f-%.0fc",
+                             asset.upper(), signal.conviction,
+                             no_price, min_cents, max_cents)
+                return None
+            entry_price = no_price / 100
 
         return {
             'asset': asset,
             'event_ticker': event_ticker,
             'entry_side': entry_side,
             'entry_price': entry_price,
-            'direction': direction,
-            'signal_move': now_price if entry_side == 'yes' else -(100 - now_price),
-            'c5_price': 0,
-            'c10_price': now_price,
+            'conviction': signal.conviction,
+            'signal': signal,
             'secs_left': event['secs_left'],
-            'sr_level': sr_level,
-            'spot_price': spot_price,
-            'confirmations': confirmations,
+            'spot_price': spot,
         }
 
     # ------------------------------------------------------------------
@@ -462,6 +451,7 @@ class BounceBackBot:
         asset = signal['asset']
         entry_side = signal['entry_side']
         entry_price = signal['entry_price']
+        msig = signal['signal']
 
         # Capital guard
         investment_cents = int(self.config.base_contracts * entry_price * 100)
@@ -485,17 +475,15 @@ class BounceBackBot:
             if not order_id:
                 logger.error("%s Order placement failed", asset.upper())
                 return
-            logger.info("%s LIVE BUY %s %dx @%.0fc (move=%.1fc, %ds left) → exit target %.0fc",
+            logger.info("%s LIVE BUY %s %dx @%.0fc (conv=%d/4, %ds left)",
                         asset.upper(), entry_side.upper(), contracts,
-                        entry_price*100, signal['signal_move'], int(signal['secs_left']),
-                        self.config.exit_target*100)
+                        entry_price*100, msig.conviction, int(signal['secs_left']))
         else:
-            logger.info("%s PAPER BUY %s %dx @%.0fc (move=%.1fc, %ds left) → exit target %.0fc",
+            logger.info("%s PAPER BUY %s %dx @%.0fc (conv=%d/4, %ds left)",
                         asset.upper(), entry_side.upper(), contracts,
-                        entry_price*100, signal['signal_move'], int(signal['secs_left']),
-                        self.config.exit_target*100)
+                        entry_price*100, msig.conviction, int(signal['secs_left']))
 
-        trade = BounceTraide(
+        trade = MomentumTrade(
             trade_id=trade_id,
             asset=asset,
             event_ticker=signal['event_ticker'],
@@ -503,32 +491,26 @@ class BounceBackBot:
             entry_side=entry_side,
             entry_price=entry_price,
             contracts=contracts,
-            signal_move=signal['signal_move'],
-            c5_price=signal['c5_price'],
-            c10_price=signal['c10_price'],
+            conviction=msig.conviction,
+            f5m_dir=msig.f5m_dir,
+            f5m_ofi=msig.f5m_ofi,
+            mid_dir=msig.mid_dir,
+            taker_buy_ratio=msig.taker_buy_ratio,
+            bb_z=msig.bb_z,
+            rsi=msig.rsi,
             entry_time=datetime.now(timezone.utc).isoformat(),
             close_time=datetime.fromtimestamp(
                 event['close_ts'], tz=timezone.utc).isoformat(),
-            rsi=signal['confirmations'].rsi if signal.get('confirmations') else None,
-            rsi_confirms=signal['confirmations'].rsi_confirms if signal.get('confirmations') else False,
-            bb_zscore=signal['confirmations'].bb_zscore if signal.get('confirmations') else None,
-            bb_confirms=signal['confirmations'].bb_confirms if signal.get('confirmations') else False,
-            rejection_wick=signal['confirmations'].rejection_wick if signal.get('confirmations') else False,
-            fvg_confirms=signal['confirmations'].fvg_confirms if signal.get('confirmations') else False,
-            fvg_direction=signal['confirmations'].fvg_direction if signal.get('confirmations') else "",
-            fvg_gap_pct=signal['confirmations'].fvg_gap_pct if signal.get('confirmations') else 0.0,
-            n_confirmations=signal['confirmations'].n_confirmations if signal.get('confirmations') else 0,
-            sr_price=signal['sr_level'].price if signal.get('sr_level') else None,
-            sr_strength=signal['sr_level'].strength if signal.get('sr_level') else None,
-            sr_touches=signal['sr_level'].touches if signal.get('sr_level') else None,
-            sr_timeframe=signal['sr_level'].timeframe if signal.get('sr_level') else None,
         )
         self.trade_log.save(trade)
         self._entered_windows.add(signal['event_ticker'])
         self._stats['trades'] += 1
-        self._stats['signals'] += 1
+        if msig.conviction == 4:
+            self._stats['conv_4'] += 1
+        else:
+            self._stats['conv_3'] += 1
 
-        # Spawn exit monitor thread to watch for scalp exit
+        # Spawn exit monitor thread
         t = threading.Thread(
             target=self._monitor_exit, args=(trade,),
             daemon=True, name=f"exit-{trade_id}"
@@ -536,16 +518,15 @@ class BounceBackBot:
         t.start()
 
     # ------------------------------------------------------------------
-    # Exit monitoring — scalp at target price
+    # Exit monitoring
     # ------------------------------------------------------------------
 
-    def _monitor_exit(self, trade: BounceTraide):
-        """Monitor an open trade and exit when price hits the target.
+    def _monitor_exit(self, trade: MomentumTrade):
+        """Monitor an open trade for stop-loss and time-exit conditions.
 
-        Runs in its own thread. Polls the contract price every exit_poll_interval
-        seconds until either:
-          1. Price hits exit_target → sell (scalp exit)
-          2. Window closes → hold to settlement (fallback)
+        Primary exit: hold to settlement.
+        Stop-loss: if conviction drops to <=1 AND price falls 15c from entry.
+        Time exit: at 2 min remaining, if losing >=10c.
         """
         try:
             close_ts = datetime.fromisoformat(
@@ -553,99 +534,108 @@ class BounceBackBot:
         except Exception:
             return
 
-        exit_target_cents = self.config.exit_target * 100  # e.g. 50c
-        max_price = trade.entry_price * 100  # track in cents
+        window_open_ts = close_ts - 900
+        entry_cents = trade.entry_price * 100
 
-        while time.time() < close_ts - 5:  # stop 5s before close
-            time.sleep(self.config.exit_poll_interval)
+        while time.time() < close_ts - 5:
+            time.sleep(10)  # Check every 10 seconds
 
-            # Get current contract price
             current_price = self.price_cache.latest(trade.event_ticker)
             if current_price is None:
                 continue
 
-            # For NO-side trades, our profit is when YES drops (NO price = 100 - YES)
+            # Calculate our side's price
             if trade.entry_side == 'no':
-                our_price = 100 - current_price  # NO mid price in cents
+                our_price_cents = 100 - current_price
             else:
-                our_price = current_price  # YES mid price in cents
+                our_price_cents = current_price
 
-            max_price = max(max_price, our_price)
+            now_ts = time.time()
+            secs_left = close_ts - now_ts
+            price_drop = entry_cents - our_price_cents
 
-            # Check if exit target hit
-            if our_price >= exit_target_cents:
-                exit_price_frac = our_price / 100
+            # --- Stop-loss check ---
+            if (self.config.stop_loss_enabled
+                    and price_drop >= self.config.stop_loss_threshold * 100):
+                # Recalculate conviction
+                try:
+                    fresh_signal = self.momentum_tracker.compute_signal(
+                        trade.asset, window_open_ts, now_ts)
+                    current_conv = fresh_signal.conviction
+                except Exception:
+                    current_conv = trade.conviction  # keep original if compute fails
+
+                if current_conv <= 1:
+                    exit_price = our_price_cents / 100
+                    fee = kalshi_fee(trade.entry_price)
+                    trade.pnl_net = (exit_price - trade.entry_price - fee) * trade.contracts
+                    trade.exit_price = exit_price
+                    trade.exit_type = 'stop_loss'
+                    trade.status = 'exited'
+                    trade.notes = f'stop_loss@{our_price_cents:.0f}c conv={current_conv}'
+
+                    if self.config.mode == 'live' and self.trader:
+                        order_id = self.trader.sell_position(
+                            trade.ticker, trade.entry_side, trade.contracts,
+                            exit_price)
+                        if order_id:
+                            trade.notes += f' order={order_id}'
+                        else:
+                            trade.notes += ' sell_failed'
+
+                    self.trade_log.save(trade)
+                    logger.info(
+                        "%s %s STOP-LOSS @%.0fc (entry=%.0fc, -%.0fc, conv=%d) P&L=$%.3f",
+                        trade.asset.upper(),
+                        "LIVE" if self.config.mode == 'live' else "PAPER",
+                        our_price_cents, entry_cents, price_drop, current_conv,
+                        trade.pnl_net
+                    )
+                    return
+
+            # --- Time exit check ---
+            if (secs_left <= self.config.time_exit_secs
+                    and price_drop >= self.config.time_exit_loss * 100):
+                exit_price = our_price_cents / 100
                 fee = kalshi_fee(trade.entry_price)
-                trade.pnl_net = (exit_price_frac - trade.entry_price - fee) * trade.contracts
-                trade.exit_price = exit_price_frac
-                trade.exit_type = 'scalp'
+                trade.pnl_net = (exit_price - trade.entry_price - fee) * trade.contracts
+                trade.exit_price = exit_price
+                trade.exit_type = 'time_exit'
                 trade.status = 'exited'
-                trade.max_price_after_entry = max_price
-                trade.notes = f'scalp_exit@{our_price:.0f}c'
+                trade.notes = f'time_exit@{our_price_cents:.0f}c {secs_left:.0f}s_left'
 
                 if self.config.mode == 'live' and self.trader:
-                    # Place sell order
-                    sell_side = trade.entry_side
-                    sell_price = int(our_price)
-                    order_id = self.trader.place_order(
-                        trade.ticker, sell_side, trade.contracts,
-                        exit_price_frac)
+                    order_id = self.trader.sell_position(
+                        trade.ticker, trade.entry_side, trade.contracts,
+                        exit_price)
                     if order_id:
                         trade.notes += f' order={order_id}'
                     else:
-                        trade.notes += ' sell_order_failed'
-                        logger.error("%s SELL ORDER FAILED @%.0fc",
-                                     trade.asset.upper(), our_price)
+                        trade.notes += ' sell_failed'
 
                 self.trade_log.save(trade)
                 logger.info(
-                    "%s %s EXIT @%.0fc (entry=%.0fc, +%.0fc) P&L=$%.3f  max=%.0fc",
+                    "%s %s TIME-EXIT @%.0fc (entry=%.0fc, -%.0fc, %ds left) P&L=$%.3f",
                     trade.asset.upper(),
                     "LIVE" if self.config.mode == 'live' else "PAPER",
-                    our_price, trade.entry_price * 100,
-                    our_price - trade.entry_price * 100,
-                    trade.pnl_net, max_price
+                    our_price_cents, entry_cents, price_drop,
+                    int(secs_left), trade.pnl_net
                 )
                 return
 
-        # Window closing without hitting target — record max price seen
-        trade.max_price_after_entry = max_price
-        trade.notes = f'no_exit_hit max={max_price:.0f}c target={exit_target_cents:.0f}c'
-        self.trade_log.save(trade)
+        # Window closing — holding to settlement
         logger.info(
-            "%s EXIT TARGET NOT HIT (target=%.0fc, max=%.0fc, entry=%.0fc) → holding to settlement",
-            trade.asset.upper(), exit_target_cents, max_price,
-            trade.entry_price * 100
+            "%s Holding to settlement (entry=%.0fc %s, conv=%d)",
+            trade.asset.upper(), entry_cents, trade.entry_side.upper(),
+            trade.conviction
         )
-
-    # ------------------------------------------------------------------
-    # Price analysis helpers
-    # ------------------------------------------------------------------
-
-    def _get_price_high(self, event_ticker: str, entry_time_str: str) -> Optional[float]:
-        """Get the highest YES price after entry time (for scalp analysis)."""
-        try:
-            entry_ts = datetime.fromisoformat(
-                entry_time_str.replace('Z', '+00:00')).timestamp()
-        except Exception:
-            return None
-        with self.price_cache._lock:
-            entries = list(self.price_cache._data.get(event_ticker, []))
-        if not entries:
-            return None
-        post_entry = [price for ts, price in entries if ts >= entry_ts]
-        return max(post_entry) if post_entry else None
 
     # ------------------------------------------------------------------
     # Settlement checking
     # ------------------------------------------------------------------
 
     def _check_settlements(self):
-        """Check open trades and settle any that have closed.
-
-        Trades that already exited via scalp (status='exited') are skipped.
-        Only 'open' trades that missed the exit target get settled here.
-        """
+        """Check open trades and settle any that have closed."""
         open_trades = self.trade_log.get_open()
         if not open_trades:
             return
@@ -665,11 +655,10 @@ class BounceBackBot:
                 series = series_map.get("15m") if isinstance(series_map, dict) else series_map
                 if not series:
                     continue
-                path = f"/trade-api/v2/markets?series_ticker={series}&status=settled&limit=20"
                 if self.trader:
                     resp = self.trader.session.get(
                         f"{KALSHI_API}/markets",
-                        headers=self.trader._headers("GET", f"/trade-api/v2/markets"),
+                        headers=self.trader._headers("GET", "/trade-api/v2/markets"),
                         params={"series_ticker": series, "status": "settled", "limit": 20},
                         timeout=10
                     )
@@ -685,17 +674,17 @@ class BounceBackBot:
                                 trade.pnl_net = (payout - trade.entry_price - fee) * trade.contracts
                                 trade.result = result
                                 trade.status = 'settled'
+                                trade.exit_type = 'settlement'
                                 trade.exit_price = payout
                                 self.trade_log.save(trade)
                                 logger.info(
-                                    "%s SETTLED %s → %s  P&L=$%.3f",
+                                    "%s SETTLED %s -> %s  conv=%d P&L=$%.3f",
                                     trade.asset.upper(), trade.entry_side.upper(),
-                                    result.upper(), trade.pnl_net
+                                    result.upper(), trade.conviction, trade.pnl_net
                                 )
                                 break
                 else:
-                    # Paper mode — check if close_time has passed, mark settled
-                    # Use price cache to infer result
+                    # Paper mode — infer result from cached price
                     final_price = self.price_cache.latest(trade.event_ticker)
                     if final_price is not None:
                         if final_price > 50:
@@ -708,22 +697,19 @@ class BounceBackBot:
                         trade.pnl_net = (payout - trade.entry_price - fee) * trade.contracts
                         trade.result = inferred
                         trade.status = 'settled'
+                        trade.exit_type = 'settlement'
                         trade.notes = f'inferred_from_price={final_price:.1f}c'
-                        # Also record the max price seen during the window for scalp analysis
-                        price_high = self._get_price_high(trade.event_ticker, trade.entry_time)
-                        if price_high is not None:
-                            trade.notes += f' high={price_high:.1f}c'
                         self.trade_log.save(trade)
                         logger.info(
-                            "%s PAPER SETTLED (inferred %s, last=%.0fc, high=%s) P&L=$%.3f",
+                            "%s PAPER SETTLED (inferred %s, last=%.0fc) conv=%d P&L=$%.3f",
                             trade.asset.upper(), inferred.upper(), final_price,
-                            f"{price_high:.0f}c" if price_high else "?",
-                            trade.pnl_net
+                            trade.conviction, trade.pnl_net
                         )
                     else:
                         # No cached price — mark as expired with unknown result
                         trade.status = 'settled'
                         trade.result = 'unknown'
+                        trade.exit_type = 'settlement'
                         trade.pnl_net = -trade.entry_price * trade.contracts  # assume loss
                         trade.notes = 'no_cached_price'
                         self.trade_log.save(trade)
@@ -742,11 +728,6 @@ class BounceBackBot:
         """One poll cycle — fetch prices, check signal, settle."""
         self._check_settlements()
 
-        # Refresh S/R levels periodically (every 15 min)
-        if self.config.sr_enabled:
-            self.sr_tracker.refresh()
-
-        # Clean up entered_windows for events that have closed
         now = time.time()
 
         for asset in ASSETS:
@@ -762,8 +743,6 @@ class BounceBackBot:
                 continue
 
             # Update price cache for all open events
-            # markets are already parsed by parse_kalshi_bracket so yes_bid/ask are 0-1 fractions
-            # Store as cents (0-100) for the chart
             for m in markets:
                 et = m.get('event_ticker')
                 if et:
@@ -786,7 +765,13 @@ class BounceBackBot:
                         except Exception:
                             pass
 
-            # Find event in the entry window
+            # Also refresh spot and record for momentum tracker
+            self.momentum_tracker.refresh(asset)
+            spot = self.momentum_tracker.get_spot(asset)
+            if spot:
+                self.momentum_tracker.record_spot(asset, spot, now)
+
+            # Find event in the eval window
             event = self._find_active_event(markets)
             if event is None:
                 continue
@@ -800,30 +785,14 @@ class BounceBackBot:
             if signal is None:
                 continue
 
-            sr_info = ""
-            if signal.get('sr_level'):
-                lvl = signal['sr_level']
-                sr_info = f" S/R={lvl.type}@${lvl.price:.0f}({lvl.source},str={lvl.strength:.1f},t={lvl.touches},{lvl.timeframe})"
-            spot_info = f" spot=${signal['spot_price']:.2f}" if signal.get('spot_price') else ""
-            conf = signal.get('confirmations')
-            conf_info = ""
-            if conf:
-                flags = []
-                if conf.rsi_confirms:
-                    flags.append(f"RSI={conf.rsi:.0f}")
-                if conf.bb_confirms:
-                    flags.append(f"BB={conf.bb_zscore:.1f}")
-                if conf.rejection_wick:
-                    flags.append("WICK")
-                if conf.fvg_confirms:
-                    flags.append(f"FVG={conf.fvg_direction[:4]}")
-                conf_info = f" conf=[{','.join(flags)}]({conf.n_confirmations}/4)" if flags else f" conf=none"
+            msig = signal['signal']
             logger.info(
-                "%s SIGNAL: contract=%.0fc → BUY %s  %ds left%s%s%s",
-                asset.upper(), signal['c10_price'],
-                signal['entry_side'].upper(),
-                int(signal['secs_left']),
-                spot_info, sr_info, conf_info
+                "%s SIGNAL: conv=%d/4 -> %s @%.0fc  f5m=%s ofi=%.2f mid=%s tbr=%.2f  bb=%.1f rsi=%.0f  %ds left",
+                asset.upper(), msig.conviction, signal['entry_side'].upper(),
+                signal['entry_price'] * 100,
+                msig.f5m_dir, msig.f5m_ofi, msig.mid_dir, msig.taker_buy_ratio,
+                msig.bb_z, msig.rsi,
+                int(signal['secs_left'])
             )
             if not self.trading_enabled:
                 logger.info("%s Trading paused — signal skipped", asset.upper())
@@ -836,12 +805,7 @@ class BounceBackBot:
     # ------------------------------------------------------------------
 
     def get_timeline_data(self) -> dict:
-        """Return price history per asset for the timeline chart.
-
-        Returns a dict keyed by asset, each containing:
-          - current_window: latest window with full price series
-          - recent_windows: last 5 completed windows with summary stats
-        """
+        """Return price history per asset for the timeline chart."""
         now = time.time()
         result = {}
 
@@ -879,18 +843,9 @@ class BounceBackBot:
                 if not prices:
                     continue
 
-                # Entry window bounds in elapsed seconds
-                entry_start_s = 900 - self.config.entry_window_max  # 300 (5 min in)
-                entry_end_s   = 900 - self.config.entry_window_min  # 660 (11 min in)
-                c5_ref_s      = 300  # 5 min into window
-
-                # Find c5 and c10 prices from the price series
-                def price_at_elapsed(target_s, tol=45):
-                    best = min(prices, key=lambda p: abs(p[0] - target_s))
-                    return best[1] if abs(best[0] - target_s) <= tol else None
-
-                c5_price  = price_at_elapsed(c5_ref_s)
-                c10_price = price_at_elapsed((entry_start_s + entry_end_s) / 2)
+                # Eval window bounds in elapsed seconds
+                eval_start_s = 900 - self.config.eval_window_max  # 420 (7 min in)
+                eval_end_s = 900 - self.config.eval_window_min    # 600 (10 min in)
 
                 # Check if a trade was taken for this window
                 trade_info = None
@@ -900,11 +855,11 @@ class BounceBackBot:
                             'side': t.entry_side,
                             'price': round(t.entry_price * 100, 1),
                             'contracts': t.contracts,
-                            'signal_move': round(t.signal_move, 1),
+                            'conviction': t.conviction,
                             'status': t.status,
                             'result': t.result,
                             'pnl': round(t.pnl_net, 3),
-                            'won': t.pnl_net > 0 if t.status == 'settled' else None,
+                            'won': t.pnl_net > 0 if t.status in ('settled', 'exited') else None,
                         }
                         break
 
@@ -914,11 +869,8 @@ class BounceBackBot:
                     'window_start_ts': window_start_ts,
                     'close_ts': close_ts,
                     'prices': prices,
-                    'entry_start_s': entry_start_s,
-                    'entry_end_s': entry_end_s,
-                    'c5_ref_s': c5_ref_s,
-                    'c5_price': c5_price,
-                    'c10_price': c10_price,
+                    'entry_start_s': eval_start_s,
+                    'entry_end_s': eval_end_s,
                     'entry_zone_min': self.config.min_entry_price * 100,
                     'entry_zone_max': self.config.max_entry_price * 100,
                     'trade': trade_info,
@@ -940,20 +892,15 @@ class BounceBackBot:
 
     def run(self):
         self.running = True
-        logger.info("Bounce-Back Bot v%s started (%s mode)", BOT_VERSION, self.config.mode)
-        logger.info("Assets: %s  Entry: %.0f-%.0fc  Exit target: %.0fc  S/R: %s  Confirm: %s  Window: %d-%ds",
+        logger.info("Momentum Bot v%s started (%s mode)", BOT_VERSION, self.config.mode)
+        logger.info("Assets: %s  Entry: %.0f-%.0fc  Conviction: %d+/4  Stop-loss: %s  Window: %d-%ds",
                     [a for a, e in self.config.enabled_assets.items() if e],
                     self.config.min_entry_price * 100,
                     self.config.max_entry_price * 100,
-                    self.config.exit_target * 100,
-                    "ON" if self.config.sr_enabled else "OFF",
-                    "REQUIRED" if self.config.require_confirmation else "logged",
-                    self.config.entry_window_min,
-                    self.config.entry_window_max)
-        # Initial S/R level load
-        if self.config.sr_enabled:
-            logger.info("Loading S/R levels...")
-            self.sr_tracker.refresh(force=True)
+                    self.config.min_conviction,
+                    "ON" if self.config.stop_loss_enabled else "OFF",
+                    self.config.eval_window_min,
+                    self.config.eval_window_max)
         while self.running:
             try:
                 self.run_once()
@@ -967,15 +914,13 @@ class BounceBackBot:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bounce-Back Bot")
+    parser = argparse.ArgumentParser(description="Momentum Bot")
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--exit-target", type=float, default=50.0,
-                        help="Exit target price in cents (sell when contract reaches this)")
-    parser.add_argument("--no-sr", action="store_true",
-                        help="Disable S/R filter (trade on price range only)")
-    parser.add_argument("--require-confirmation", action="store_true",
-                        help="Require at least 1 confirmation signal (RSI/BB/wick)")
+    parser.add_argument("--min-conviction", type=int, default=3,
+                        help="Minimum conviction score (3 or 4)")
+    parser.add_argument("--no-stop-loss", action="store_true",
+                        help="Disable stop-loss exits")
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
 
@@ -996,14 +941,13 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("Auth failed: %s — falling back to paper", e)
 
-    config = BounceConfig(
+    config = MomentumConfig(
         mode=args.mode,
         base_contracts=args.contracts,
-        exit_target=args.exit_target / 100,  # CLI takes cents, config stores fraction
-        sr_enabled=not args.no_sr,
-        require_confirmation=args.require_confirmation,
+        min_conviction=args.min_conviction,
+        stop_loss_enabled=not args.no_stop_loss,
         poll_interval=args.poll,
     )
 
-    bot = BounceBackBot(config, trader)
+    bot = MomentumBot(config, trader)
     bot.run()

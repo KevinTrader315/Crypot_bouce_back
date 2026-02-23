@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bounce-Back Bot Dashboard — Flask web UI on port 5052
+Momentum Bot Dashboard — Flask web UI on port 5052
 """
 import argparse
 import json
@@ -11,12 +11,12 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
-from bounce_bot import BounceBackBot, BounceConfig, KalshiTrader, ASSETS, BOT_VERSION
+from momentum_bot import MomentumBot, MomentumConfig, KalshiTrader, ASSETS, BOT_VERSION
 
 logger = logging.getLogger("dashboard")
 
 app = Flask(__name__)
-bot: BounceBackBot = None
+bot: MomentumBot = None
 
 # ---------------------------------------------------------------------------
 # HTML Dashboard
@@ -26,7 +26,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Bounce-Back Bot</title>
+<title>Momentum Bot v{{ version }}</title>
 <script>
 async function toggleMode() {
   const btn = document.getElementById('modeBtn');
@@ -43,7 +43,7 @@ function updateModeBtn(mode) {
   const btn = document.getElementById('modeBtn');
   if (!btn) return;
   const isLive = mode === 'live';
-  btn.textContent = isLive ? '● LIVE — Switch to Paper' : '○ PAPER — Switch to Live';
+  btn.textContent = isLive ? '\\u25cf LIVE \\u2014 Switch to Paper' : '\\u25cb PAPER \\u2014 Switch to Live';
   btn.style.background = isLive ? 'rgba(63,185,80,0.15)' : 'rgba(227,179,65,0.12)';
   btn.style.color = isLive ? '#3fb950' : '#e3b341';
   btn.style.borderColor = isLive ? 'rgba(63,185,80,0.3)' : 'rgba(227,179,65,0.25)';
@@ -62,32 +62,30 @@ function updateBtn(enabled) {
   const btn = document.getElementById('tradeBtn');
   if (!btn) return;
   if (enabled) {
-    btn.textContent = '⏸ Pause Trading';
+    btn.textContent = '\\u23f8 Pause Trading';
     btn.style.background = 'rgba(248,81,73,0.15)';
     btn.style.color = '#f85149';
     btn.style.borderColor = 'rgba(248,81,73,0.3)';
   } else {
-    btn.textContent = '▶ Resume Trading';
+    btn.textContent = '\\u25b6 Resume Trading';
     btn.style.background = 'rgba(63,185,80,0.15)';
     btn.style.color = '#3fb950';
     btn.style.borderColor = 'rgba(63,185,80,0.3)';
   }
 }
-// Sync button states + live config from API on load and each refresh
 async function syncStatus() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
     updateBtn(d.trading_enabled !== false);
     updateModeBtn(d.mode || 'paper');
-    // Keep contracts input in sync with live bot value
     const inp = document.getElementById('contractsInput');
     if (inp && d.base_contracts != null) inp.value = d.base_contracts;
   } catch(e) {}
 }
 window.addEventListener('DOMContentLoaded', () => { syncStatus(); startAutoRefresh(); });
 
-// ── Timeline chart ──────────────────────────────────────────────
+// -- Timeline chart --
 const ASSET_COLORS = {btc:'#f7931a', eth:'#627eea', sol:'#9945ff'};
 const WINDOW_SECS = 900;
 
@@ -101,34 +99,24 @@ function drawChart(canvas, window_data, compact) {
 
   if (!window_data || !window_data.prices || window_data.prices.length < 2) {
     ctx.fillStyle = '#555';
-    ctx.font = `${compact?9:11}px monospace`;
+    ctx.font = (compact?9:11)+'px monospace';
     ctx.textAlign = 'center';
     ctx.fillText('No data yet', W/2, H/2);
     return;
   }
 
   const prices = window_data.prices;
-  const threshold = window_data.threshold || 8;
-  const entry_start = window_data.entry_start_s || 540;
-  const entry_end   = window_data.entry_end_s   || 660;
-  const c5_ref_s    = window_data.c5_ref_s      || 600;
-  const c5_price    = window_data.c5_price;
-  const c10_price   = window_data.c10_price;
+  const entry_start = window_data.entry_start_s || 420;
+  const entry_end   = window_data.entry_end_s   || 600;
   const trade       = window_data.trade;
 
-  // Y range: tight fit to data, always wide enough to show both signal bands
+  // Y range: tight fit to data
   const vals = prices.map(p => p[1]);
   const dataMin = Math.min(...vals);
   const dataMax = Math.max(...vals);
   const pad = Math.max((dataMax - dataMin) * 0.2, 4);
   let yMin = Math.max(0,   Math.floor(dataMin - pad));
   let yMax = Math.min(100, Math.ceil(dataMax  + pad));
-  // Expand to always include both threshold bands (but don't pull yMin to 0 just because lower band clips)
-  if (c5_price != null) {
-    yMax = Math.min(100, Math.max(yMax, Math.ceil(c5_price + threshold + 2)));
-    const lowerBand = Math.floor(c5_price - threshold - 2);
-    if (lowerBand > 1) yMin = Math.max(0, Math.min(yMin, lowerBand));
-  }
   if (yMax - yMin < 12) { const mid = (yMin+yMax)/2; yMin = Math.max(0, Math.floor(mid-6)); yMax = Math.min(100, Math.ceil(mid+6)); }
 
   function xPx(s)   { return PAD.l + (s / WINDOW_SECS) * cW; }
@@ -144,8 +132,8 @@ function drawChart(canvas, window_data, compact) {
   for (let v = Math.ceil(yMin/10)*10; v <= yMax; v += 10) {
     const y = yPx(v);
     ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(PAD.l + cW, y); ctx.stroke();
-    ctx.fillStyle = '#444'; ctx.font = `${compact?7:9}px monospace`; ctx.textAlign = 'right';
-    ctx.fillText(v + '¢', PAD.l - 3, y + 3);
+    ctx.fillStyle = '#444'; ctx.font = (compact?7:9)+'px monospace'; ctx.textAlign = 'right';
+    ctx.fillText(v + 'c', PAD.l - 3, y + 3);
   }
   if (!compact) {
     for (let s = 0; s <= WINDOW_SECS; s += 180) {
@@ -156,51 +144,28 @@ function drawChart(canvas, window_data, compact) {
     }
   }
 
-  // Entry window shading
-  ctx.fillStyle = 'rgba(227,179,65,0.07)';
+  // Eval window shading
+  ctx.fillStyle = 'rgba(88,166,255,0.07)';
   ctx.fillRect(xPx(entry_start), PAD.t, xPx(entry_end) - xPx(entry_start), cH);
-  ctx.strokeStyle = 'rgba(227,179,65,0.25)';
+  ctx.strokeStyle = 'rgba(88,166,255,0.25)';
   ctx.lineWidth = 1;
   ctx.setLineDash([3,3]);
   ctx.beginPath(); ctx.moveTo(xPx(entry_start), PAD.t); ctx.lineTo(xPx(entry_start), PAD.t+cH); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(xPx(entry_end),   PAD.t); ctx.lineTo(xPx(entry_end),   PAD.t+cH); ctx.stroke();
   ctx.setLineDash([]);
 
-  // c5 reference line + threshold bands
-  if (c5_price != null) {
-    const yC5 = yPx(c5_price);
-    // Center line (c5 price)
-    ctx.strokeStyle = 'rgba(88,166,255,0.35)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4,4]);
-    ctx.beginPath(); ctx.moveTo(xPx(c5_ref_s - 10), yC5); ctx.lineTo(xPx(entry_end + 30), yC5); ctx.stroke();
-    ctx.setLineDash([]);
-    // +threshold band — red dashed (contract ROSE above this → buy NO)
-    ctx.strokeStyle = 'rgba(248,81,73,0.6)';
+  // Entry price zone bands (45-78c)
+  const zoneMin = window_data.entry_zone_min || 45;
+  const zoneMax = window_data.entry_zone_max || 78;
+  if (zoneMin >= yMin && zoneMax <= yMax) {
+    ctx.fillStyle = 'rgba(63,185,80,0.04)';
+    ctx.fillRect(PAD.l, yPx(zoneMax), cW, yPx(zoneMin) - yPx(zoneMax));
+    ctx.strokeStyle = 'rgba(63,185,80,0.2)';
     ctx.lineWidth = 1;
     ctx.setLineDash([2,4]);
-    ctx.beginPath();
-    ctx.moveTo(xPx(c5_ref_s), yPx(c5_price + threshold));
-    ctx.lineTo(xPx(entry_end + 30), yPx(c5_price + threshold));
-    ctx.stroke();
-    // -threshold band — green dashed (contract FELL below this → buy YES)
-    if (true) {
-      ctx.strokeStyle = 'rgba(63,185,80,0.6)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([2,4]);
-      ctx.beginPath();
-      ctx.moveTo(xPx(c5_ref_s), yPx(c5_price - threshold));
-      ctx.lineTo(xPx(entry_end + 30), yPx(c5_price - threshold));
-      ctx.stroke();
-    }
+    ctx.beginPath(); ctx.moveTo(PAD.l, yPx(zoneMin)); ctx.lineTo(PAD.l+cW, yPx(zoneMin)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(PAD.l, yPx(zoneMax)); ctx.lineTo(PAD.l+cW, yPx(zoneMax)); ctx.stroke();
     ctx.setLineDash([]);
-    // c5 dot
-    ctx.fillStyle = '#58a6ff';
-    ctx.beginPath(); ctx.arc(xPx(c5_ref_s), yC5, compact?3:4, 0, Math.PI*2); ctx.fill();
-    if (!compact) {
-      ctx.fillStyle = '#58a6ff'; ctx.font = '8px monospace'; ctx.textAlign = 'left';
-      ctx.fillText('c5', xPx(c5_ref_s)+5, yC5-4);
-    }
   }
 
   // Price line
@@ -216,17 +181,6 @@ function drawChart(canvas, window_data, compact) {
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   });
   ctx.stroke();
-
-  // c10 dot (current price at entry moment)
-  if (c10_price != null) {
-    const entryMid = (entry_start + entry_end) / 2;
-    ctx.fillStyle = '#e3b341';
-    ctx.beginPath(); ctx.arc(xPx(entryMid), yPx(c10_price), compact?3:5, 0, Math.PI*2); ctx.fill();
-    if (!compact) {
-      ctx.fillStyle = '#e3b341'; ctx.font = '8px monospace'; ctx.textAlign = 'left';
-      ctx.fillText('c10', xPx(entryMid)+5, yPx(c10_price)-4);
-    }
-  }
 
   // Trade entry marker
   if (trade) {
@@ -249,7 +203,9 @@ function drawChart(canvas, window_data, compact) {
     ctx.closePath(); ctx.fill();
     if (!compact) {
       ctx.fillStyle = markerColor; ctx.font = 'bold 8px monospace'; ctx.textAlign = 'center';
-      ctx.fillText(trade.side.toUpperCase() + ' ' + trade.price + '¢', xPx(entryMid), entryPx + (trade.side==='yes'?-13:16));
+      const convLabel = trade.conviction ? ' ['+trade.conviction+'/4]' : '';
+      ctx.fillText(trade.side.toUpperCase() + ' ' + trade.price + 'c' + convLabel,
+        xPx(entryMid), entryPx + (trade.side==='yes'?-13:16));
     }
   }
 
@@ -278,46 +234,43 @@ function renderTimeline(data) {
     const rw = d.recent_windows || [];
     const color = ASSET_COLORS[asset];
 
-    html += `<div class="tl-asset">
-      <div class="tl-asset-label" style="color:${color}">${asset.toUpperCase()}</div>
-      <div class="tl-body">`;
+    html += '<div class="tl-asset">' +
+      '<div class="tl-asset-label" style="color:'+color+'">'+asset.toUpperCase()+'</div>' +
+      '<div class="tl-body">';
 
     // Current window
-    html += `<div class="tl-current">
-      <div class="tl-section-label">Current Window
-        ${cw ? `<span style="color:#555;font-size:.7rem;margin-left:.5rem">${cw.event_ticker||''}</span>` : ''}
-        ${cw && cw.seconds_remaining > 0 ? `<span class="tl-countdown" id="cd-${asset}">${Math.round(cw.seconds_remaining)}s</span>` : ''}
-      </div>
-      <canvas id="canvas-${asset}-current" width="820" height="130" style="display:block;max-width:100%"></canvas>
-    </div>`;
+    html += '<div class="tl-current">' +
+      '<div class="tl-section-label">Current Window' +
+        (cw ? '<span style="color:#555;font-size:.7rem;margin-left:.5rem">'+((cw.event_ticker)||'')+'</span>' : '') +
+        (cw && cw.seconds_remaining > 0 ? '<span class="tl-countdown" id="cd-'+asset+'">'+Math.round(cw.seconds_remaining)+'s</span>' : '') +
+      '</div>' +
+      '<canvas id="canvas-'+asset+'-current" width="820" height="130" style="display:block;max-width:100%"></canvas>' +
+    '</div>';
 
     // Recent windows
     if (rw.length > 0) {
-      html += `<div class="tl-section-label" style="margin-top:.75rem">Recent Windows</div>`;
-      html += `<div class="tl-recent-grid">`;
+      html += '<div class="tl-section-label" style="margin-top:.75rem">Recent Windows</div>';
+      html += '<div class="tl-recent-grid">';
       for (let i = 0; i < rw.length; i++) {
         const w = rw[i];
         const trade = w.trade;
-        const move = w.c5_price != null && w.c10_price != null ? (w.c10_price - w.c5_price) : null;
-        const signalFired = move != null && Math.abs(move) >= (w.threshold || 8);
         const label = w.close_time ? w.close_time.substring(11,16)+'Z' : '';
-        const tradeLabel = trade ? `<span class="tl-trade-badge" style="color:${trade.won===true?'#3fb950':trade.won===false?'#f85149':'#e3b341'}">${trade.side.toUpperCase()} ${trade.price}¢ ${trade.won===true?'✓':trade.won===false?'✗':'…'}</span>` : (signalFired ? '<span style="color:#555;font-size:.65rem">signal — no trade</span>' : '');
-        html += `<div class="tl-recent-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
-            <span style="font-size:.65rem;color:#555">${label}</span>${tradeLabel}
-          </div>
-          <canvas id="canvas-${asset}-recent-${i}" width="160" height="65" style="display:block;width:100%"></canvas>
-          <div style="font-size:.65rem;color:#555;margin-top:3px;display:flex;justify-content:space-between">
-            <span>c5: ${w.c5_price!=null?Math.round(w.c5_price)+'¢':'—'}</span>
-            <span>c10: ${w.c10_price!=null?Math.round(w.c10_price)+'¢':'—'}</span>
-            <span style="color:${move!=null&&move>0?'#3fb950':move!=null&&move<0?'#f85149':'#555'}">${move!=null?(move>0?'+':'')+move.toFixed(1)+'¢':'—'}</span>
-          </div>
-        </div>`;
+        const tradeLabel = trade ?
+          '<span class="tl-trade-badge" style="color:'+(trade.won===true?'#3fb950':trade.won===false?'#f85149':'#e3b341')+'">'+
+            trade.side.toUpperCase()+' '+trade.price+'c ['+trade.conviction+'/4] '+
+            (trade.won===true?'W':trade.won===false?'L':'...')+
+          '</span>' : '';
+        html += '<div class="tl-recent-card">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">' +
+            '<span style="font-size:.65rem;color:#555">'+label+'</span>'+tradeLabel +
+          '</div>' +
+          '<canvas id="canvas-'+asset+'-recent-'+i+'" width="160" height="65" style="display:block;width:100%"></canvas>' +
+        '</div>';
       }
-      html += `</div>`;
+      html += '</div>';
     }
 
-    html += `</div></div>`;
+    html += '</div></div>';
   }
   container.innerHTML = html;
 
@@ -326,10 +279,10 @@ function renderTimeline(data) {
     const d = data[asset] || {};
     const cw = d.current_window;
     const rw = d.recent_windows || [];
-    const cvs = document.getElementById(`canvas-${asset}-current`);
+    const cvs = document.getElementById('canvas-'+asset+'-current');
     if (cvs) { cvs.width = cvs.offsetWidth || 820; drawChart(cvs, cw, false); }
     for (let i = 0; i < rw.length; i++) {
-      const rc = document.getElementById(`canvas-${asset}-recent-${i}`);
+      const rc = document.getElementById('canvas-'+asset+'-recent-'+i);
       if (rc) { rc.width = rc.offsetWidth || 160; drawChart(rc, rw[i], true); }
     }
   }
@@ -350,7 +303,7 @@ function tickCountdowns() {
     const el = document.getElementById('cd-' + asset);
     if (!el) continue;
     const left = Math.round((cd.ends - Date.now()) / 1000);
-    el.textContent = left > 0 ? left + 's' : 'settling…';
+    el.textContent = left > 0 ? left + 's' : 'settling...';
     el.style.color = left < 60 ? '#f85149' : left < 180 ? '#e3b341' : '#3fb950';
   }
 }
@@ -371,39 +324,46 @@ async function fetchStats() {
     const el = document.getElementById('stats-card');
     if (!el) return;
     const closed = (s.closed||0);
-    const wr = closed ? (s.win_rate*100).toFixed(1)+'% ('+s.wins+'/'+closed+')' : '—';
+    const wr = closed ? (s.win_rate*100).toFixed(1)+'% ('+s.wins+'/'+closed+')' : '\\u2014';
     const pnl = s.total_pnl ? '$'+(s.total_pnl>=0?'+':'')+s.total_pnl.toFixed(3) : '$0.000';
-    el.innerHTML = `
-      <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">${s.total||0}</span></div>
-      <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">${s.open||0}</span></div>
-      <div class="stat"><span class="stat-l">Scalp Exits</span><span class="stat-v" style="color:var(--green)">${s.scalp_exits||0}</span></div>
-      <div class="stat"><span class="stat-l">Held to Settlement</span><span class="stat-v">${s.held_to_settlement||0}</span></div>
-      <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v ${s.win_rate>=0.6?'pos':s.win_rate>0&&s.win_rate<0.4?'neg':''}">${wr}</span></div>
-      <div class="stat"><span class="stat-l">Total P&amp;L</span><span class="stat-v ${s.total_pnl>=0?'pos':'neg'}">${pnl}</span></div>`;
+    const c4wr = s.conv_4 ? (s.conv_4_wr*100).toFixed(0)+'%' : '\\u2014';
+    const c3wr = s.conv_3 ? (s.conv_3_wr*100).toFixed(0)+'%' : '\\u2014';
+    el.innerHTML =
+      '<div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">'+((s.total)||0)+'</span></div>' +
+      '<div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">'+((s.open)||0)+'</span></div>' +
+      '<div class="stat"><span class="stat-l">4/4 Conv</span><span class="stat-v" style="color:var(--green)">'+((s.conv_4)||0)+' ('+c4wr+')</span></div>' +
+      '<div class="stat"><span class="stat-l">3/4 Conv</span><span class="stat-v" style="color:var(--yellow)">'+((s.conv_3)||0)+' ('+c3wr+')</span></div>' +
+      '<div class="stat"><span class="stat-l">Settlements</span><span class="stat-v">'+((s.settlements)||0)+'</span></div>' +
+      '<div class="stat"><span class="stat-l">Stop-Losses</span><span class="stat-v" style="color:var(--red)">'+((s.stop_losses)||0)+'</span></div>' +
+      '<div class="stat"><span class="stat-l">Time Exits</span><span class="stat-v">'+((s.time_exits)||0)+'</span></div>' +
+      '<div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v '+(s.win_rate>=0.6?'pos':s.win_rate>0&&s.win_rate<0.4?'neg':'')+'">'+wr+'</span></div>' +
+      '<div class="stat"><span class="stat-l">Total P&amp;L</span><span class="stat-v '+(s.total_pnl>=0?'pos':'neg')+'">'+pnl+'</span></div>';
 
     // Recent trades table
     const trades = (d.trades || []).slice(-20).reverse();
     const tbl = document.getElementById('trades-table');
     if (!tbl) return;
-    if (!trades.length) { tbl.innerHTML = '<tr><td colspan="10" style="color:var(--dim);text-align:center;padding:1rem">No trades yet</td></tr>'; return; }
-    tbl.innerHTML = trades.map(t => {
-      const exitLabel = t.exit_type === 'scalp' ? `SCALP @${Math.round((t.exit_price||0)*100)}¢`
-        : t.status === 'settled' ? `SETTLE ${(t.result||'?').toUpperCase()}`
-        : t.status === 'open' ? 'MONITORING' : '—';
-      const exitColor = t.exit_type === 'scalp' ? 'var(--green)' : t.status === 'settled' ? 'var(--dim)' : 'var(--accent)';
-      const maxP = t.max_price_after_entry != null ? Math.round(t.max_price_after_entry) + '¢' : '—';
-      return `<tr>
-      <td>${t.entry_time.substring(11,19)}</td>
-      <td style="font-weight:700;color:var(--orange)">${t.asset.toUpperCase()}</td>
-      <td><span class="badge badge-${t.entry_side}">${t.entry_side.toUpperCase()}</span></td>
-      <td>${Math.round(t.entry_price*100)}¢</td>
-      <td>${t.contracts}</td>
-      <td style="color:${t.signal_move>0?'var(--green)':'var(--red)'}">${t.signal_move>0?'+':''}${t.signal_move.toFixed(1)}¢</td>
-      <td style="font-size:.7rem;color:var(--dim)">${Math.round(t.c5_price)}→${Math.round(t.c10_price)}¢</td>
-      <td style="font-size:.7rem;color:${exitColor}">${exitLabel}</td>
-      <td style="font-size:.7rem">${maxP}</td>
-      <td class="${t.pnl_net>0?'pos':t.pnl_net<0?'neg':''}">${t.pnl_net?'$'+t.pnl_net.toFixed(3):'—'}</td>
-    </tr>`;}).join('');
+    if (!trades.length) { tbl.innerHTML = '<tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">No trades yet</td></tr>'; return; }
+    tbl.innerHTML = trades.map(function(t) {
+      const exitLabel = t.exit_type === 'stop_loss' ? 'STOP @'+Math.round((t.exit_price||0)*100)+'c'
+        : t.exit_type === 'time_exit' ? 'TIME @'+Math.round((t.exit_price||0)*100)+'c'
+        : t.status === 'settled' ? 'SETTLE '+(t.result||'?').toUpperCase()
+        : t.status === 'open' ? 'HOLDING' : '\\u2014';
+      const exitColor = t.exit_type === 'stop_loss' ? 'var(--red)' : t.exit_type === 'time_exit' ? 'var(--yellow)' : t.status === 'settled' ? 'var(--dim)' : 'var(--accent)';
+      const convColor = t.conviction === 4 ? 'var(--green)' : 'var(--yellow)';
+      const signals = t.f5m_dir.substring(0,1).toUpperCase() + '/' + t.mid_dir.substring(0,1).toUpperCase() + '/' + (t.taker_buy_ratio > 0.55 ? 'B' : t.taker_buy_ratio < 0.45 ? 'S' : '-');
+      return '<tr>' +
+      '<td>'+t.entry_time.substring(11,19)+'</td>' +
+      '<td style="font-weight:700;color:var(--orange)">'+t.asset.toUpperCase()+'</td>' +
+      '<td><span class="badge badge-'+t.entry_side+'">'+t.entry_side.toUpperCase()+'</span></td>' +
+      '<td>'+Math.round(t.entry_price*100)+'c</td>' +
+      '<td>'+t.contracts+'</td>' +
+      '<td style="color:'+convColor+';font-weight:700">'+t.conviction+'/4</td>' +
+      '<td style="font-size:.7rem;color:var(--dim)">'+signals+'</td>' +
+      '<td style="font-size:.7rem;color:'+exitColor+'">'+exitLabel+'</td>' +
+      '<td class="'+(t.pnl_net>0?'pos':t.pnl_net<0?'neg':'')+'">'+
+        (t.pnl_net?'$'+t.pnl_net.toFixed(3):'\\u2014')+'</td>' +
+    '</tr>';}).join('');
   } catch(e) {}
 }
 
@@ -414,7 +374,7 @@ async function saveContracts() {
   try {
     const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base_contracts: val})});
     const d = await r.json();
-    if (d.ok) { fb.textContent = '✓ saved'; fb.style.color='var(--green)'; setTimeout(()=>fb.textContent='', 2000); }
+    if (d.ok) { fb.textContent = 'saved'; fb.style.color='var(--green)'; setTimeout(function(){fb.textContent='';}, 2000); }
     else { fb.textContent = d.error || 'error'; fb.style.color='var(--red)'; }
   } catch(e) { fb.textContent = 'error'; fb.style.color='var(--red)'; }
 }
@@ -467,19 +427,19 @@ function startAutoRefresh() {
 </head>
 <body>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
-  <h1 style="margin:0">Bounce-Back Bot v{{ version }} &mdash; <span class="mode-{{ mode }}">{{ mode.upper() }}</span></h1>
+  <h1 style="margin:0">Momentum Bot v{{ version }} &mdash; <span class="mode-{{ mode }}">{{ mode.upper() }}</span></h1>
   <div style="display:flex;gap:0.5rem;">
     <button id="modeBtn" onclick="toggleMode()" style="
       padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
       font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
       background:rgba(227,179,65,0.12);color:#e3b341;border-color:rgba(227,179,65,0.25);">
-      ○ PAPER — Switch to Live
+      &#9675; PAPER &mdash; Switch to Live
     </button>
     <button id="tradeBtn" onclick="toggleTrading()" style="
       padding:0.4rem 1rem;border-radius:6px;cursor:pointer;font-family:monospace;
       font-size:0.8rem;font-weight:700;border:1px solid;transition:all 0.2s;
       background:rgba(248,81,73,0.15);color:#f85149;border-color:rgba(248,81,73,0.3);">
-      ⏸ Pause Trading
+      &#9208; Pause Trading
     </button>
   </div>
 </div>
@@ -490,16 +450,17 @@ function startAutoRefresh() {
     <div id="stats-card">
       <div class="stat"><span class="stat-l">Total Trades</span><span class="stat-v">{{ summary.total }}</span></div>
       <div class="stat"><span class="stat-l">Open</span><span class="stat-v" style="color:var(--accent)">{{ summary.open }}</span></div>
-      <div class="stat"><span class="stat-l">Scalp Exits</span><span class="stat-v" style="color:#3fb950">{{ summary.scalp_exits }}</span></div>
-      <div class="stat"><span class="stat-l">Held to Settlement</span><span class="stat-v">{{ summary.held_to_settlement }}</span></div>
-      <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v">—</span></div>
-      <div class="stat"><span class="stat-l">Total P&L</span><span class="stat-v">$0.000</span></div>
+      <div class="stat"><span class="stat-l">4/4 Conv</span><span class="stat-v" style="color:var(--green)">{{ summary.conv_4 }}</span></div>
+      <div class="stat"><span class="stat-l">3/4 Conv</span><span class="stat-v" style="color:var(--yellow)">{{ summary.conv_3 }}</span></div>
+      <div class="stat"><span class="stat-l">Win Rate</span><span class="stat-v">&mdash;</span></div>
+      <div class="stat"><span class="stat-l">Total P&amp;L</span><span class="stat-v">$0.000</span></div>
     </div>
   </div>
   <div class="card">
     <h3>Config</h3>
-    <div class="stat"><span class="stat-l">Entry Window</span><span class="stat-v">{{ entry_min }}-{{ entry_max }}s remaining</span></div>
-    <div class="stat"><span class="stat-l">S/R Filter</span><span class="stat-v" style="color:{{ 'var(--green)' if sr_enabled else 'var(--red)' }}">{{ 'ON' if sr_enabled else 'OFF' }}</span></div>
+    <div class="stat"><span class="stat-l">Eval Window</span><span class="stat-v">{{ eval_min }}-{{ eval_max }}s left (7-10m in)</span></div>
+    <div class="stat"><span class="stat-l">Min Conviction</span><span class="stat-v" style="color:var(--green)">{{ min_conv }}/4</span></div>
+    <div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:{{ 'var(--green)' if stop_loss else 'var(--red)' }}">{{ 'ON (-15c + conv<=1)' if stop_loss else 'OFF' }}</span></div>
     <div class="stat">
       <span class="stat-l">Base Contracts</span>
       <span class="stat-v" style="display:flex;align-items:center;gap:.4rem">
@@ -512,37 +473,34 @@ function startAutoRefresh() {
         <span id="contractsFb" style="font-size:.7rem;color:var(--dim)"></span>
       </span>
     </div>
-    <div class="stat"><span class="stat-l">Exit Target</span><span class="stat-v">{{ exit_target }}¢</span></div>
-    <div class="stat"><span class="stat-l">Entry Range</span><span class="stat-v">{{ min_entry }}-{{ max_entry }}¢</span></div>
+    <div class="stat"><span class="stat-l">Entry Range</span><span class="stat-v">{{ min_entry }}-{{ max_entry }}c (expensive side)</span></div>
     <div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">{{ max_open }}</span></div>
     <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
   </div>
   <div class="card" style="grid-column:1/-1">
     <div class="tl-legend">
-      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="#e3b341" stroke-width="1.5" stroke-dasharray="3,3"/></svg> Entry window ({{ entry_min }}–{{ entry_max }}s remaining)</span>
-      <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#58a6ff"/></svg> c5 price (5 min before close)</span>
-      <span><svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="#e3b341"/></svg> c10 price (at entry check)</span>
-      <span><svg width="8" height="8"><polygon points="4,0 8,8 0,8" fill="#3fb950"/></svg> Trade entry (▲ YES / ▼ NO)</span>
-      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.5)" stroke-width="1" stroke-dasharray="2,4"/></svg> {{ min_entry }}-{{ max_entry }}¢ entry zone</span>
+      <span><svg width="20" height="8"><rect x="0" y="0" width="20" height="8" fill="rgba(88,166,255,0.15)" stroke="rgba(88,166,255,0.4)" stroke-width="1"/></svg> Eval window (7-10m into window)</span>
+      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.4)" stroke-width="1" stroke-dasharray="2,4"/></svg> {{ min_entry }}-{{ max_entry }}c entry zone</span>
+      <span><svg width="8" height="8"><polygon points="4,0 8,8 0,8" fill="#3fb950"/></svg> Trade entry (conv 3-4/4)</span>
     </div>
   </div>
 </div>
 
 <!-- Timeline -->
 <div id="timeline-container" style="margin-bottom:1rem">
-  <div style="color:var(--dim);text-align:center;padding:2rem">Loading timeline…</div>
+  <div style="color:var(--dim);text-align:center;padding:2rem">Loading timeline...</div>
 </div>
 
 <!-- Trade log -->
 <div class="card" style="margin-bottom:1rem">
   <h3>Recent Trades (last 20)</h3>
   <table>
-    <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th><th>Move</th><th>C5→C10</th><th>Exit</th><th>Max</th><th>P&L</th></tr></thead>
-    <tbody id="trades-table"><tr><td colspan="10" style="color:var(--dim);text-align:center;padding:1rem">Loading…</td></tr></tbody>
+    <thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Qty</th><th>Conv</th><th>Signals</th><th>Exit</th><th>P&amp;L</th></tr></thead>
+    <tbody id="trades-table"><tr><td colspan="9" style="color:var(--dim);text-align:center;padding:1rem">Loading...</td></tr></tbody>
   </table>
 </div>
 
-<div style="color:var(--dim);font-size:.7rem">Auto-refresh 15s &middot; Bounce-Back v{{ version }}</div>
+<div style="color:var(--dim);font-size:.7rem">Auto-refresh 5s &middot; Momentum v{{ version }}</div>
 </body>
 </html>"""
 
@@ -551,20 +509,19 @@ function startAutoRefresh() {
 def index():
     global bot
     summary = bot.trade_log.summary() if bot else {}
-    trades = sorted(bot.trade_log.all(), key=lambda t: t.entry_time, reverse=True)[:20] if bot else []
-    cfg = bot.config if bot else BounceConfig()
+    cfg = bot.config if bot else MomentumConfig()
     return render_template_string(
         DASHBOARD_HTML,
         version=BOT_VERSION,
         mode=cfg.mode,
         summary=summary,
-        entry_min=cfg.entry_window_min,
-        entry_max=cfg.entry_window_max,
+        eval_min=cfg.eval_window_min,
+        eval_max=cfg.eval_window_max,
+        min_conv=cfg.min_conviction,
+        stop_loss=cfg.stop_loss_enabled,
         contracts=cfg.base_contracts,
-        exit_target=int(cfg.exit_target * 100),
         min_entry=int(cfg.min_entry_price * 100),
         max_entry=int(cfg.max_entry_price * 100),
-        sr_enabled=cfg.sr_enabled,
         assets=', '.join(a.upper() for a, e in cfg.enabled_assets.items() if e),
         max_open=cfg.max_open_positions,
         poll=cfg.poll_interval,
@@ -611,14 +568,14 @@ def api_status():
         "summary": bot.trade_log.summary(),
         "stats": bot._stats,
         "open_trades": len(bot.trade_log.get_open()),
-        # Live config — included so portal rules tab and bot dashboard stay in sync
+        # Live config
         "base_contracts": bot.config.base_contracts,
         "min_entry_price": bot.config.min_entry_price,
         "max_entry_price": bot.config.max_entry_price,
-        "sr_enabled": bot.config.sr_enabled,
-        "exit_target": bot.config.exit_target,
-        "entry_window_min": bot.config.entry_window_min,
-        "entry_window_max": bot.config.entry_window_max,
+        "min_conviction": bot.config.min_conviction,
+        "stop_loss_enabled": bot.config.stop_loss_enabled,
+        "eval_window_min": bot.config.eval_window_min,
+        "eval_window_max": bot.config.eval_window_max,
         "max_open_positions": bot.config.max_open_positions,
     })
 
@@ -672,9 +629,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--exit-target", type=float, default=50.0)
-    parser.add_argument("--no-sr", action="store_true")
-    parser.add_argument("--require-confirmation", action="store_true")
+    parser.add_argument("--min-conviction", type=int, default=3,
+                        help="Minimum conviction score (3 or 4)")
+    parser.add_argument("--no-stop-loss", action="store_true",
+                        help="Disable stop-loss exits")
     parser.add_argument("--port", type=int, default=5052)
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
@@ -695,16 +653,15 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning("Auth failed: %s — live mode toggle will be unavailable", e)
 
-    config = BounceConfig(
+    config = MomentumConfig(
         mode=args.mode,
         base_contracts=args.contracts,
-        exit_target=args.exit_target / 100,
-        sr_enabled=not args.no_sr,
-        require_confirmation=args.require_confirmation,
+        min_conviction=args.min_conviction,
+        stop_loss_enabled=not args.no_stop_loss,
         poll_interval=args.poll,
     )
 
-    bot = BounceBackBot(config, trader)
+    bot = MomentumBot(config, trader)
     threading.Thread(target=bot.run, daemon=True).start()
 
     logger.info("Dashboard: http://localhost:%d", args.port)
