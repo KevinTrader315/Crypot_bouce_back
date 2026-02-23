@@ -122,6 +122,9 @@ class BounceTraide:
     bb_zscore: Optional[float] = None
     bb_confirms: bool = False
     rejection_wick: bool = False
+    fvg_confirms: bool = False
+    fvg_direction: str = ""
+    fvg_gap_pct: float = 0.0
     n_confirmations: int = 0
     # S/R level details
     sr_price: Optional[float] = None
@@ -148,7 +151,10 @@ class TradeLog:
                         'exit_type': None, 'max_price_after_entry': None,
                         'rsi': None, 'rsi_confirms': False,
                         'bb_zscore': None, 'bb_confirms': False,
-                        'rejection_wick': False, 'n_confirmations': 0,
+                        'rejection_wick': False,
+                        'fvg_confirms': False, 'fvg_direction': '',
+                        'fvg_gap_pct': 0.0,
+                        'n_confirmations': 0,
                         'sr_price': None, 'sr_strength': None,
                         'sr_touches': None, 'sr_timeframe': None,
                     }
@@ -416,12 +422,13 @@ class BounceBackBot:
 
         if self.config.log_confirmations:
             logger.debug(
-                "%s Confirmations: RSI=%.1f(%s) BB=%.2f(%s) Wick=%s → %d/3",
+                "%s Confirmations: RSI=%.1f(%s) BB=%.2f(%s) Wick=%s FVG=%s → %d/4",
                 asset.upper(), confirmations.rsi,
                 "✓" if confirmations.rsi_confirms else "✗",
                 confirmations.bb_zscore,
                 "✓" if confirmations.bb_confirms else "✗",
                 "✓" if confirmations.rejection_wick else "✗",
+                f"✓ {confirmations.fvg_direction} {confirmations.fvg_gap_pct:.3%}" if confirmations.fvg_confirms else "✗",
                 confirmations.n_confirmations,
             )
 
@@ -507,6 +514,9 @@ class BounceBackBot:
             bb_zscore=signal['confirmations'].bb_zscore if signal.get('confirmations') else None,
             bb_confirms=signal['confirmations'].bb_confirms if signal.get('confirmations') else False,
             rejection_wick=signal['confirmations'].rejection_wick if signal.get('confirmations') else False,
+            fvg_confirms=signal['confirmations'].fvg_confirms if signal.get('confirmations') else False,
+            fvg_direction=signal['confirmations'].fvg_direction if signal.get('confirmations') else "",
+            fvg_gap_pct=signal['confirmations'].fvg_gap_pct if signal.get('confirmations') else 0.0,
             n_confirmations=signal['confirmations'].n_confirmations if signal.get('confirmations') else 0,
             sr_price=signal['sr_level'].price if signal.get('sr_level') else None,
             sr_strength=signal['sr_level'].strength if signal.get('sr_level') else None,
@@ -805,7 +815,9 @@ class BounceBackBot:
                     flags.append(f"BB={conf.bb_zscore:.1f}")
                 if conf.rejection_wick:
                     flags.append("WICK")
-                conf_info = f" conf=[{','.join(flags)}]({conf.n_confirmations}/3)" if flags else f" conf=none"
+                if conf.fvg_confirms:
+                    flags.append(f"FVG={conf.fvg_direction[:4]}")
+                conf_info = f" conf=[{','.join(flags)}]({conf.n_confirmations}/4)" if flags else f" conf=none"
             logger.info(
                 "%s SIGNAL: contract=%.0fc → BUY %s  %ds left%s%s%s",
                 asset.upper(), signal['c10_price'],

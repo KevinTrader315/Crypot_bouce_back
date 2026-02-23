@@ -57,6 +57,11 @@ RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 BB_ZSCORE_EXTREME = 1.5
 
+# FVG (Fair Value Gap) parameters
+FVG_LOOKBACK_5M = 24     # 24 x 5m = 2 hours of 5m candles for confirmation
+FVG_MIN_SIZE_PCT = 0.001  # Minimum gap size as % of price (0.1%) to qualify
+FVG_FILL_PCT = 0.5        # Gap is "filled" if price retraced >50% of it
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -105,7 +110,25 @@ class ConfirmationResult:
     bb_zscore: float = 0.0
     bb_confirms: bool = False
     rejection_wick: bool = False
+    fvg_confirms: bool = False
+    fvg_direction: str = ""       # "bullish" or "bearish"
+    fvg_gap_pct: float = 0.0     # Size of the FVG as % of price
+    fvg_fill_pct: float = 0.0    # How much of the gap has been filled (0-1)
     n_confirmations: int = 0
+
+
+@dataclass
+class FVG:
+    """A Fair Value Gap — 3-candle imbalance zone."""
+    high: float          # Top of the gap zone
+    low: float           # Bottom of the gap zone
+    mid: float           # Midpoint (used as S/R level price)
+    direction: str       # "bullish" (gap up, acts as support) or "bearish" (gap down, acts as resistance)
+    gap_pct: float       # Gap size as % of price
+    timestamp: int       # Timestamp of the middle (impulse) candle
+    timeframe: str       # "5m", "1h", "4h"
+    filled: bool = False # Whether price has retraced into the gap
+    fill_pct: float = 0.0  # How much has been filled (0 = untouched, 1 = fully filled)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +378,176 @@ def _detect_session_levels(candles_1h: List[Candle], asset: str) -> List[Level]:
     return levels
 
 
+# ---------------------------------------------------------------------------
+# Fair Value Gap (FVG) Detection
+# ---------------------------------------------------------------------------
+
+def detect_fvgs(candles: List[Candle], timeframe: str,
+                min_gap_pct: float = FVG_MIN_SIZE_PCT) -> List[FVG]:
+    """
+    Detect Fair Value Gaps in a series of candles.
+
+    A bullish FVG forms when candle 2 rallies so hard that candle 1's high
+    is below candle 3's low — leaving a gap that acts as support.
+
+    A bearish FVG forms when candle 2 drops so hard that candle 1's low
+    is above candle 3's high — leaving a gap that acts as resistance.
+
+    After detection, we check if subsequent candles have filled the gap.
+    """
+    fvgs = []
+    n = len(candles)
+    if n < 3:
+        return fvgs
+
+    for i in range(1, n - 1):
+        c1 = candles[i - 1]  # candle before
+        c2 = candles[i]      # impulse candle
+        c3 = candles[i + 1]  # candle after
+
+        ref_price = c2.close
+        if ref_price <= 0:
+            continue
+
+        # Bullish FVG: c1.high < c3.low (gap up — unfilled zone is support)
+        if c1.high < c3.low:
+            gap_low = c1.high
+            gap_high = c3.low
+            gap_pct = (gap_high - gap_low) / ref_price
+
+            if gap_pct >= min_gap_pct:
+                fvg = FVG(
+                    high=gap_high, low=gap_low,
+                    mid=(gap_high + gap_low) / 2,
+                    direction="bullish", gap_pct=gap_pct,
+                    timestamp=c2.timestamp, timeframe=timeframe,
+                )
+                # Check if subsequent candles filled the gap
+                _check_fvg_fill(fvg, candles[i + 2:])
+                fvgs.append(fvg)
+
+        # Bearish FVG: c1.low > c3.high (gap down — unfilled zone is resistance)
+        if c1.low > c3.high:
+            gap_high = c1.low
+            gap_low = c3.high
+            gap_pct = (gap_high - gap_low) / ref_price
+
+            if gap_pct >= min_gap_pct:
+                fvg = FVG(
+                    high=gap_high, low=gap_low,
+                    mid=(gap_high + gap_low) / 2,
+                    direction="bearish", gap_pct=gap_pct,
+                    timestamp=c2.timestamp, timeframe=timeframe,
+                )
+                _check_fvg_fill(fvg, candles[i + 2:])
+                fvgs.append(fvg)
+
+    return fvgs
+
+
+def _check_fvg_fill(fvg: FVG, subsequent_candles: List[Candle]):
+    """Check how much of an FVG has been filled by subsequent price action."""
+    gap_size = fvg.high - fvg.low
+    if gap_size <= 0:
+        return
+
+    max_penetration = 0.0
+
+    for c in subsequent_candles:
+        if fvg.direction == "bullish":
+            # Bullish FVG fills when price drops into the gap from above
+            if c.low < fvg.high:
+                penetration = fvg.high - max(c.low, fvg.low)
+                max_penetration = max(max_penetration, penetration)
+        else:
+            # Bearish FVG fills when price rises into the gap from below
+            if c.high > fvg.low:
+                penetration = min(c.high, fvg.high) - fvg.low
+                max_penetration = max(max_penetration, penetration)
+
+    fvg.fill_pct = min(1.0, max_penetration / gap_size)
+    fvg.filled = fvg.fill_pct >= FVG_FILL_PCT
+
+
+def fvgs_to_levels(fvgs: List[FVG], asset: str) -> List[Level]:
+    """
+    Convert unfilled FVGs from 1h/4h timeframes into S/R levels.
+
+    Bullish FVGs → support levels (price left buyers behind, tends to bounce)
+    Bearish FVGs → resistance levels (price left sellers behind, tends to reject)
+
+    Only unfilled or partially filled FVGs qualify — filled ones are spent.
+    """
+    levels = []
+
+    for fvg in fvgs:
+        if fvg.filled:
+            continue  # Gap already filled, no longer active
+
+        # Strength based on gap size and how unfilled it is
+        # Larger gaps = stronger. Less filled = more relevant.
+        size_score = min(1.0, fvg.gap_pct / 0.005)  # 0.5% gap = max size score
+        fill_factor = 1.0 - fvg.fill_pct  # Untouched = 1.0, half-filled = 0.5
+        strength = size_score * fill_factor * 0.7  # Cap at 0.7, confluence will boost
+
+        if fvg.direction == "bullish":
+            ltype = "support"
+        else:
+            ltype = "resistance"
+
+        levels.append(Level(
+            price=round(fvg.mid, 2),
+            type=ltype,
+            source="fvg",
+            strength=strength,
+            touches=1,  # FVG itself counts as 1 touch (the impulse)
+            timeframe=fvg.timeframe,
+            asset=asset,
+            timestamp=fvg.timestamp,
+        ))
+
+    return levels
+
+
+def check_fvg_confirmation(candles_5m: List[Candle], spot: float,
+                           direction: str) -> Tuple[bool, str, float, float]:
+    """
+    Check if current price is sitting inside an unfilled 5m FVG.
+
+    This is a confirmation signal — if price is at S/R AND inside an FVG,
+    the imbalance zone adds confluence for a bounce.
+
+    direction: "up" → look for bullish FVGs (support), "down" → bearish (resistance)
+
+    Returns (confirms, fvg_direction, gap_pct, fill_pct)
+    """
+    if not candles_5m or len(candles_5m) < 3:
+        return False, "", 0.0, 0.0
+
+    fvgs = detect_fvgs(candles_5m, "5m")
+
+    # Find unfilled FVGs that contain the current price
+    for fvg in fvgs:
+        if fvg.filled:
+            continue
+
+        price_in_gap = fvg.low <= spot <= fvg.high
+
+        if not price_in_gap:
+            # Also check if price is very close to the gap edge (within 0.05%)
+            proximity = min(abs(spot - fvg.low), abs(spot - fvg.high))
+            if spot > 0 and proximity / spot > 0.0005:
+                continue
+
+        # Check direction match
+        if direction == "up" and fvg.direction == "bullish":
+            return True, "bullish", fvg.gap_pct, fvg.fill_pct
+        elif direction == "down" and fvg.direction == "bearish":
+            return True, "bearish", fvg.gap_pct, fvg.fill_pct
+
+    return False, "", 0.0, 0.0
+
+
 def _merge_and_cluster(all_levels: List[Level]) -> List[Level]:
     """
     Merge nearby levels with multi-TF confluence scoring.
@@ -476,10 +669,14 @@ def detect_rejection_wick(candles: List[Candle], direction: str,
     return False
 
 
-def check_confirmations(candles_1m: List[Candle], direction: str) -> ConfirmationResult:
+def check_confirmations(candles_1m: List[Candle], direction: str,
+                        candles_5m: Optional[List[Candle]] = None,
+                        spot: Optional[float] = None) -> ConfirmationResult:
     """
     Check all confirmation signals for a bounce trade.
     direction: "up" (at support) or "down" (at resistance)
+    candles_5m: optional 5m candles for FVG confirmation
+    spot: current spot price for FVG proximity check
     """
     result = ConfirmationResult()
 
@@ -500,8 +697,18 @@ def check_confirmations(candles_1m: List[Candle], direction: str) -> Confirmatio
 
     result.rejection_wick = detect_rejection_wick(candles_1m, direction, n_candles=3)
 
+    # 5m FVG confirmation
+    if candles_5m and spot and len(candles_5m) >= 3:
+        fvg_ok, fvg_dir, fvg_gap, fvg_fill = check_fvg_confirmation(
+            candles_5m, spot, direction)
+        result.fvg_confirms = fvg_ok
+        result.fvg_direction = fvg_dir
+        result.fvg_gap_pct = fvg_gap
+        result.fvg_fill_pct = fvg_fill
+
     result.n_confirmations = sum([
-        result.rsi_confirms, result.bb_confirms, result.rejection_wick,
+        result.rsi_confirms, result.bb_confirms,
+        result.rejection_wick, result.fvg_confirms,
     ])
 
     return result
@@ -542,9 +749,31 @@ def compute_levels(asset: str) -> List[Level]:
     if candles_1h:
         all_levels.extend(_detect_session_levels(candles_1h, asset))
 
+    # FVGs from 1h and 4h candles → S/R zones
+    if len(candles_1h) >= 3:
+        fvgs_1h = detect_fvgs(candles_1h, "1h")
+        fvg_levels_1h = fvgs_to_levels(fvgs_1h, asset)
+        all_levels.extend(fvg_levels_1h)
+        logger.debug("%s: %d 1h FVGs found, %d unfilled → levels",
+                     asset.upper(), len(fvgs_1h), len(fvg_levels_1h))
+
+    if len(candles_4h) >= 3:
+        fvgs_4h = detect_fvgs(candles_4h, "4h")
+        fvg_levels_4h = fvgs_to_levels(fvgs_4h, asset)
+        # 4h FVGs are more significant
+        for l in fvg_levels_4h:
+            l.strength = min(1.0, l.strength * 1.3)
+        all_levels.extend(fvg_levels_4h)
+        logger.debug("%s: %d 4h FVGs found, %d unfilled → levels",
+                     asset.upper(), len(fvgs_4h), len(fvg_levels_4h))
+
     # Merge, cluster, filter
     merged = _merge_and_cluster(all_levels)
-    qualified = [l for l in merged if l.touches >= MIN_TOUCHES or "swing" not in l.source]
+    # Allow swing (need 2+ touches), fvg (always pass), round/session (always pass)
+    qualified = [l for l in merged
+                 if l.touches >= MIN_TOUCHES
+                 or "swing" not in l.source
+                 or "fvg" in l.source]
 
     if spot:
         qualified.sort(key=lambda l: abs(l.price - spot))
@@ -568,8 +797,10 @@ class SRTracker:
         self._levels: dict[str, List[Level]] = {}
         self._spot_cache: dict[str, float] = {}
         self._candles_1m_cache: dict[str, List[Candle]] = {}
+        self._candles_5m_cache: dict[str, List[Candle]] = {}
         self._last_refresh: float = 0
         self._last_1m_fetch: dict[str, float] = {}
+        self._last_5m_fetch: dict[str, float] = {}
         self._lock = threading.Lock()
         self._load()
 
@@ -705,12 +936,26 @@ class SRTracker:
 
     def check_confirmations(self, asset: str, direction: str) -> ConfirmationResult:
         """
-        Check RSI, BB z-score, and rejection wick signals.
+        Check RSI, BB z-score, rejection wick, and 5m FVG signals.
         direction: "up" (at support) or "down" (at resistance)
         """
         self._refresh_1m_candles(asset)
-        candles = self._candles_1m_cache.get(asset, [])
-        return check_confirmations(candles, direction)
+        self._refresh_5m_candles(asset)
+        candles_1m = self._candles_1m_cache.get(asset, [])
+        candles_5m = self._candles_5m_cache.get(asset, [])
+        spot = self._spot_cache.get(asset)
+        return check_confirmations(candles_1m, direction,
+                                   candles_5m=candles_5m, spot=spot)
+
+    def _refresh_5m_candles(self, asset: str):
+        """Fetch recent 5m candles for FVG confirmation."""
+        now = time.time()
+        if now - self._last_5m_fetch.get(asset, 0) < 60:  # Cache 60s
+            return
+        candles = fetch_klines(asset, "5m", FVG_LOOKBACK_5M)
+        if candles:
+            self._candles_5m_cache[asset] = candles
+            self._last_5m_fetch[asset] = now
 
     def get_level_summary(self, asset: str) -> dict:
         """Summary for dashboard display."""
