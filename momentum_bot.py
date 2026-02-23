@@ -623,12 +623,31 @@ class MomentumBot:
                 )
                 return
 
-        # Window closing — holding to settlement
-        logger.info(
-            "%s Holding to settlement (entry=%.0fc %s, conv=%d)",
-            trade.asset.upper(), entry_cents, trade.entry_side.upper(),
-            trade.conviction
-        )
+        # Wait until ~1s before close to capture final contract price
+        remaining = close_ts - time.time()
+        if remaining > 1:
+            time.sleep(remaining - 1)
+
+        final_price = self.price_cache.latest(trade.event_ticker)
+        if final_price is not None:
+            if trade.entry_side == 'no':
+                our_final = 100 - final_price
+            else:
+                our_final = final_price
+            trade.exit_price = our_final / 100
+            trade.notes = f'final_contract={our_final:.0f}c'
+            self.trade_log.save(trade)
+            logger.info(
+                "%s Holding to settlement (entry=%.0fc %s, conv=%d, final=%.0fc)",
+                trade.asset.upper(), entry_cents, trade.entry_side.upper(),
+                trade.conviction, our_final
+            )
+        else:
+            logger.info(
+                "%s Holding to settlement (entry=%.0fc %s, conv=%d, no final price)",
+                trade.asset.upper(), entry_cents, trade.entry_side.upper(),
+                trade.conviction
+            )
 
     # ------------------------------------------------------------------
     # Settlement checking
