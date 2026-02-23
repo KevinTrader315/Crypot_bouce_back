@@ -43,7 +43,7 @@ from kalshi_fetcher import (
     parse_kalshi_bracket,
 )
 from capital_guard import CapitalGuard
-from support_resistance import SRTracker, fetch_spot_price
+from support_resistance import SRTracker, ConfirmationResult, fetch_spot_price
 
 logger = logging.getLogger("BounceBot")
 
@@ -72,6 +72,10 @@ class BounceConfig:
     # Support/Resistance filter — only trade when spot is at a key level
     sr_enabled: bool = True            # Require S/R confirmation for entry
 
+    # Confirmation signals — from V2 backtest (RSI, BB, rejection wick)
+    require_confirmation: bool = False  # If True, need at least 1 confirmation to trade
+    log_confirmations: bool = True      # Log confirmation details for analysis
+
     # Exit — scalp at fixed price target, don't hold to settlement
     exit_target: float = 0.50          # Sell when contract reaches 50c (backtest best)
     exit_poll_interval: int = 5        # Check exit price every 5 seconds
@@ -81,7 +85,7 @@ class BounceConfig:
     poll_interval: int = 15
     log_file: str = "data/bounce_trades.jsonl"
 
-    # Assets — SOL disabled (backtest: not mean-reverting)
+    # Assets — all enabled (V2 backtest: ETH best, BTC solid, SOL marginal)
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": False
     })
@@ -112,6 +116,18 @@ class BounceTraide:
     result: Optional[str] = None
     pnl_net: float = 0.0
     max_price_after_entry: Optional[float] = None  # highest contract price seen post-entry
+    # Confirmation signals at entry
+    rsi: Optional[float] = None
+    rsi_confirms: bool = False
+    bb_zscore: Optional[float] = None
+    bb_confirms: bool = False
+    rejection_wick: bool = False
+    n_confirmations: int = 0
+    # S/R level details
+    sr_price: Optional[float] = None
+    sr_strength: Optional[float] = None
+    sr_touches: Optional[int] = None
+    sr_timeframe: Optional[str] = None
     notes: str = ""
 
 
@@ -127,10 +143,18 @@ class TradeLog:
             with open(self.filepath) as f:
                 for line in f:
                     t = json.loads(line)
-                    # Handle records from before exit_type/max_price fields existed
-                    for key in ('exit_type', 'max_price_after_entry'):
+                    # Handle records from before new fields existed
+                    defaults = {
+                        'exit_type': None, 'max_price_after_entry': None,
+                        'rsi': None, 'rsi_confirms': False,
+                        'bb_zscore': None, 'bb_confirms': False,
+                        'rejection_wick': False, 'n_confirmations': 0,
+                        'sr_price': None, 'sr_strength': None,
+                        'sr_touches': None, 'sr_timeframe': None,
+                    }
+                    for key, default in defaults.items():
                         if key not in t:
-                            t[key] = None
+                            t[key] = default
                     self._trades[t['trade_id']] = BounceTraide(**t)
         except FileNotFoundError:
             pass
@@ -176,7 +200,7 @@ class KalshiTrader:
         self.session = requests.Session()
 
     def _headers(self, method: str, path: str) -> dict:
-        return sign_request(self.api_key, self.private_key, method, path)
+        return sign_request(self.private_key, self.api_key, method, path)
 
     def get_balance(self) -> Optional[int]:
         try:
@@ -350,6 +374,7 @@ class BounceBackBot:
           1. Contract YES price is in the 10-30c range → cheap side is YES
              OR contract YES price is in the 70-90c range → cheap side is NO
           2. Spot price is near a support (for YES) or resistance (for NO)
+          3. (Optional) Confirmation signals: RSI extreme, BB z-score, rejection wick
         """
         event_ticker = event['event_ticker']
 
@@ -363,18 +388,17 @@ class BounceBackBot:
 
         # Determine which side is cheap
         if min_cents <= now_price <= max_cents:
-            # YES is cheap (10-30c) → buy YES, expecting bounce up
             entry_side = 'yes'
             entry_price = now_price / 100
+            direction = 'up'       # YES cheap = price dropped, expect bounce up
         elif (100 - max_cents) <= now_price <= (100 - min_cents):
-            # NO is cheap (YES is 70-90c) → buy NO, expecting YES to drop
             entry_side = 'no'
             entry_price = (100 - now_price) / 100
+            direction = 'down'     # NO cheap = price rallied, expect drop
         else:
-            # Contract price not in our target range
             return None
 
-        # S/R filter: only trade when spot is at a key level
+        # S/R filter
         sr_level = None
         spot_price = None
         if self.config.sr_enabled:
@@ -387,17 +411,40 @@ class BounceBackBot:
                 return None
             self._stats['sr_passed'] += 1
 
+        # Confirmation signals (RSI, BB, rejection wick)
+        confirmations = self.sr_tracker.check_confirmations(asset, direction)
+
+        if self.config.log_confirmations:
+            logger.debug(
+                "%s Confirmations: RSI=%.1f(%s) BB=%.2f(%s) Wick=%s → %d/3",
+                asset.upper(), confirmations.rsi,
+                "✓" if confirmations.rsi_confirms else "✗",
+                confirmations.bb_zscore,
+                "✓" if confirmations.bb_confirms else "✗",
+                "✓" if confirmations.rejection_wick else "✗",
+                confirmations.n_confirmations,
+            )
+
+        # Optional: require at least 1 confirmation
+        if self.config.require_confirmation and confirmations.n_confirmations < 1:
+            logger.debug("%s No confirmations, skip (require_confirmation=True)",
+                         asset.upper())
+            self._stats['sr_blocked'] += 1
+            return None
+
         return {
             'asset': asset,
             'event_ticker': event_ticker,
             'entry_side': entry_side,
             'entry_price': entry_price,
+            'direction': direction,
             'signal_move': now_price if entry_side == 'yes' else -(100 - now_price),
-            'c5_price': 0,  # not used in new logic
+            'c5_price': 0,
             'c10_price': now_price,
             'secs_left': event['secs_left'],
             'sr_level': sr_level,
             'spot_price': spot_price,
+            'confirmations': confirmations,
         }
 
     # ------------------------------------------------------------------
@@ -455,6 +502,16 @@ class BounceBackBot:
             entry_time=datetime.now(timezone.utc).isoformat(),
             close_time=datetime.fromtimestamp(
                 event['close_ts'], tz=timezone.utc).isoformat(),
+            rsi=signal['confirmations'].rsi if signal.get('confirmations') else None,
+            rsi_confirms=signal['confirmations'].rsi_confirms if signal.get('confirmations') else False,
+            bb_zscore=signal['confirmations'].bb_zscore if signal.get('confirmations') else None,
+            bb_confirms=signal['confirmations'].bb_confirms if signal.get('confirmations') else False,
+            rejection_wick=signal['confirmations'].rejection_wick if signal.get('confirmations') else False,
+            n_confirmations=signal['confirmations'].n_confirmations if signal.get('confirmations') else 0,
+            sr_price=signal['sr_level'].price if signal.get('sr_level') else None,
+            sr_strength=signal['sr_level'].strength if signal.get('sr_level') else None,
+            sr_touches=signal['sr_level'].touches if signal.get('sr_level') else None,
+            sr_timeframe=signal['sr_level'].timeframe if signal.get('sr_level') else None,
         )
         self.trade_log.save(trade)
         self._entered_windows.add(signal['event_ticker'])
@@ -736,14 +793,25 @@ class BounceBackBot:
             sr_info = ""
             if signal.get('sr_level'):
                 lvl = signal['sr_level']
-                sr_info = f" S/R={lvl.type}@${lvl.price:.0f}({lvl.source},str={lvl.strength})"
+                sr_info = f" S/R={lvl.type}@${lvl.price:.0f}({lvl.source},str={lvl.strength:.1f},t={lvl.touches},{lvl.timeframe})"
             spot_info = f" spot=${signal['spot_price']:.2f}" if signal.get('spot_price') else ""
+            conf = signal.get('confirmations')
+            conf_info = ""
+            if conf:
+                flags = []
+                if conf.rsi_confirms:
+                    flags.append(f"RSI={conf.rsi:.0f}")
+                if conf.bb_confirms:
+                    flags.append(f"BB={conf.bb_zscore:.1f}")
+                if conf.rejection_wick:
+                    flags.append("WICK")
+                conf_info = f" conf=[{','.join(flags)}]({conf.n_confirmations}/3)" if flags else f" conf=none"
             logger.info(
-                "%s SIGNAL: contract=%.0fc → BUY %s  %ds left%s%s",
+                "%s SIGNAL: contract=%.0fc → BUY %s  %ds left%s%s%s",
                 asset.upper(), signal['c10_price'],
                 signal['entry_side'].upper(),
                 int(signal['secs_left']),
-                spot_info, sr_info
+                spot_info, sr_info, conf_info
             )
             if not self.trading_enabled:
                 logger.info("%s Trading paused — signal skipped", asset.upper())
@@ -861,12 +929,13 @@ class BounceBackBot:
     def run(self):
         self.running = True
         logger.info("Bounce-Back Bot v%s started (%s mode)", BOT_VERSION, self.config.mode)
-        logger.info("Assets: %s  Entry: %.0f-%.0fc  Exit target: %.0fc  S/R: %s  Window: %d-%ds",
+        logger.info("Assets: %s  Entry: %.0f-%.0fc  Exit target: %.0fc  S/R: %s  Confirm: %s  Window: %d-%ds",
                     [a for a, e in self.config.enabled_assets.items() if e],
                     self.config.min_entry_price * 100,
                     self.config.max_entry_price * 100,
                     self.config.exit_target * 100,
                     "ON" if self.config.sr_enabled else "OFF",
+                    "REQUIRED" if self.config.require_confirmation else "logged",
                     self.config.entry_window_min,
                     self.config.entry_window_max)
         # Initial S/R level load
@@ -893,6 +962,8 @@ if __name__ == "__main__":
                         help="Exit target price in cents (sell when contract reaches this)")
     parser.add_argument("--no-sr", action="store_true",
                         help="Disable S/R filter (trade on price range only)")
+    parser.add_argument("--require-confirmation", action="store_true",
+                        help="Require at least 1 confirmation signal (RSI/BB/wick)")
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
 
@@ -918,6 +989,7 @@ if __name__ == "__main__":
         base_contracts=args.contracts,
         exit_target=args.exit_target / 100,  # CLI takes cents, config stores fraction
         sr_enabled=not args.no_sr,
+        require_confirmation=args.require_confirmation,
         poll_interval=args.poll,
     )
 

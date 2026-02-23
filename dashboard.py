@@ -674,6 +674,7 @@ if __name__ == "__main__":
     parser.add_argument("--contracts", type=int, default=5)
     parser.add_argument("--exit-target", type=float, default=50.0)
     parser.add_argument("--no-sr", action="store_true")
+    parser.add_argument("--require-confirmation", action="store_true")
     parser.add_argument("--port", type=int, default=5052)
     parser.add_argument("--poll", type=int, default=15)
     args = parser.parse_args()
@@ -699,6 +700,7 @@ if __name__ == "__main__":
         base_contracts=args.contracts,
         exit_target=args.exit_target / 100,
         sr_enabled=not args.no_sr,
+        require_confirmation=args.require_confirmation,
         poll_interval=args.poll,
     )
 

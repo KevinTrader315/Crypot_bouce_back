@@ -13,10 +13,16 @@ if [ "${DISABLE_SR:-}" = "true" ]; then
     SR_FLAG="--no-sr"
 fi
 
+CONF_FLAG=""
+if [ "${REQUIRE_CONFIRMATION:-}" = "true" ]; then
+    CONF_FLAG="--require-confirmation"
+fi
+
 exec python3 dashboard.py \
   --mode "${BOT_MODE:-paper}" \
   --contracts "${CONTRACTS:-5}" \
   --exit-target "${EXIT_TARGET:-50}" \
   --port 5052 \
   --poll "${POLL_INTERVAL:-15}" \
-  $SR_FLAG
+  $SR_FLAG \
+  $CONF_FLAG
