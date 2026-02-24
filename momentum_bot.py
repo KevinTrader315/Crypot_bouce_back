@@ -561,10 +561,11 @@ class MomentumBot:
             secs_left = close_ts - now_ts
             price_drop = entry_cents - our_price_cents
 
-            # --- Stop-loss check (v3.1: pure price-based, no conviction recheck) ---
+            # --- Stop-loss check (v3.2: skip stops on conv 4 trades) ---
             if (self.config.stop_loss_enabled
-                    and price_drop >= self.config.stop_loss_threshold * 100):
-                # Safety stop: exit if price dropped beyond threshold
+                    and price_drop >= self.config.stop_loss_threshold * 100
+                    and trade.conviction < 4):
+                # Safety stop: exit if price dropped beyond threshold (conv 4 holds to settlement)
                 current_conv = trade.conviction  # logged for reference
                 if True:  # always trigger at threshold
                     exit_price = our_price_cents / 100

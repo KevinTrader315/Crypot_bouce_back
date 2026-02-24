@@ -460,7 +460,7 @@ function startAutoRefresh() {
     <h3>Config</h3>
     <div class="stat"><span class="stat-l">Eval Window</span><span class="stat-v">{{ eval_min }}-{{ eval_max }}s left (7-10m in)</span></div>
     <div class="stat"><span class="stat-l">Min Conviction</span><span class="stat-v" style="color:var(--green)">{{ min_conv }}/4</span></div>
-    <div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:{{ 'var(--green)' if stop_loss else 'var(--red)' }}">{{ 'ON (-15c + conv<=1)' if stop_loss else 'OFF' }}</span></div>
+    <div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:{{ 'var(--green)' if stop_loss else 'var(--red)' }}">{{ 'ON (conv&lt;4 only)' if stop_loss else 'OFF' }}</span></div>
     <div class="stat">
       <span class="stat-l">Base Contracts</span>
       <span class="stat-v" style="display:flex;align-items:center;gap:.4rem">
