@@ -1,5 +1,5 @@
 """
-Momentum Continuation Signals — V3
+Momentum Continuation Signals — V3.1
 
 Computes 4-signal conviction score for 15-min crypto windows:
   1. first_5m_dir — which direction did spot move in first 5 min?
@@ -13,7 +13,11 @@ Signal discovery analysis on 16,639 windows proved:
   - BB z > 2: 77.2% WR, +27.2% edge (N=838)
   - First 5m YES strong: 72.5% WR, +22.5% edge (N=3373)
 
-Data sources: OKX primary, Binance.US fallback (no auth needed).
+V3.1 fix: Switched to Binance primary with real taker_buy_vol (kline[9])
+instead of OKX candle-direction approximation. Aligns with window_logger.py
+ground truth that produced the signal discovery stats above.
+
+Data sources: Binance.US primary, OKX fallback (no auth needed).
 """
 
 import logging
@@ -48,6 +52,7 @@ class Candle:
     low: float
     close: float
     volume: float
+    taker_buy_vol: float = 0.0  # Real taker buy volume (Binance kline[9])
 
     @property
     def is_bullish(self) -> bool:
@@ -95,11 +100,33 @@ class MomentumSignal:
 
 
 # ---------------------------------------------------------------------------
-# Data fetching — OKX primary, Binance.US fallback
+# Data fetching — Binance.US primary (has taker_buy_vol), OKX fallback
 # ---------------------------------------------------------------------------
 
+def _fetch_klines_binance(asset: str, interval: str, limit: int = 200) -> List[Candle]:
+    """Primary: fetch klines from Binance.US with real taker_buy_vol."""
+    symbol = BINANCE_SYMBOLS.get(asset, "BTCUSDT")
+    try:
+        resp = requests.get(
+            f"{BINANCE_BASE}/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return [Candle(
+            timestamp=int(c[0]) // 1000,
+            open=float(c[1]), high=float(c[2]),
+            low=float(c[3]), close=float(c[4]),
+            volume=float(c[5]),
+            taker_buy_vol=float(c[9]),  # Real taker buy volume
+        ) for c in resp.json() if float(c[2]) > 0]
+    except Exception as e:
+        logger.warning("Binance fetch %s %s: %s", asset, interval, e)
+        return []
+
+
 def _fetch_klines_okx(asset: str, interval: str, limit: int = 200) -> List[Candle]:
-    """Fetch klines from OKX. No auth needed."""
+    """Fallback: fetch klines from OKX (no taker_buy_vol available)."""
     symbol = OKX_SYMBOLS.get(asset)
     if not symbol:
         return []
@@ -134,11 +161,14 @@ def _fetch_klines_okx(asset: str, interval: str, limit: int = 200) -> List[Candl
                 break
 
             for c in batch:
+                # OKX doesn't provide taker_buy_vol — approximate from candle direction
+                vol = float(c[5])
                 all_candles.append(Candle(
                     timestamp=int(c[0]) // 1000,
                     open=float(c[1]), high=float(c[2]),
                     low=float(c[3]), close=float(c[4]),
-                    volume=float(c[5]),
+                    volume=vol,
+                    taker_buy_vol=vol if float(c[4]) >= float(c[1]) else 0.0,
                 ))
 
             after = batch[-1][0]
@@ -155,34 +185,13 @@ def _fetch_klines_okx(asset: str, interval: str, limit: int = 200) -> List[Candl
         return []
 
 
-def _fetch_klines_binance(asset: str, interval: str, limit: int = 200) -> List[Candle]:
-    """Fallback: fetch klines from Binance.US."""
-    symbol = BINANCE_SYMBOLS.get(asset, "BTCUSDT")
-    try:
-        resp = requests.get(
-            f"{BINANCE_BASE}/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return [Candle(
-            timestamp=int(c[0]) // 1000,
-            open=float(c[1]), high=float(c[2]),
-            low=float(c[3]), close=float(c[4]),
-            volume=float(c[5]),
-        ) for c in resp.json() if float(c[2]) > 0]
-    except Exception as e:
-        logger.warning("Binance fetch %s %s: %s", asset, interval, e)
-        return []
-
-
 def fetch_klines(asset: str, interval: str, limit: int = 200) -> List[Candle]:
-    """Fetch candles — OKX first, Binance.US fallback."""
-    candles = _fetch_klines_okx(asset, interval, limit)
+    """Fetch candles — Binance.US first (real taker_buy_vol), OKX fallback."""
+    candles = _fetch_klines_binance(asset, interval, limit)
     if candles:
         return candles
-    logger.info("OKX unavailable for %s %s, trying Binance.US", asset, interval)
-    return _fetch_klines_binance(asset, interval, limit)
+    logger.info("Binance unavailable for %s %s, trying OKX", asset, interval)
+    return _fetch_klines_okx(asset, interval, limit)
 
 
 def fetch_spot_price(asset: str) -> Optional[float]:
@@ -299,65 +308,64 @@ class MomentumTracker:
                        now_ts: float) -> MomentumSignal:
         """Compute the 4-signal conviction score for the current window.
 
-        Uses spot ticks within the window to compute:
-        - first_5m_dir: compare spot at 0m vs 5m
-        - first_5m_ofi: use 1m candle taker volumes in first 5m
-        - mid_dir: compare spot at 5m vs now (7-10m)
-        - taker_buy_ratio: aggregate taker buy / total volume
+        V3.1: Uses 1m candle open/close and real taker_buy_vol (Binance kline[9])
+        to match window_logger.py ground truth computation:
+        - f5m_dir: candles[0].open vs candles[4].close (first 5 1m candles)
+        - f5m_ofi: 2*(sum(taker_buy_vol)/sum(volume))-1 for first 5 candles
+        - mid_dir: candles[5].open vs candles[9].close (mid 5 1m candles)
+        - taker_buy_ratio: sum(taker_buy_vol)/sum(volume) for all window candles
 
         Also computes BB z-score and RSI from 1m candles.
         """
         candles = self._candle_cache.get(asset, [])
-        spots = self._window_spots.get(asset, [])
 
-        # Filter spots to this window
-        window_spots = [(ts, p) for ts, p in spots
-                        if window_open_ts <= ts <= now_ts]
+        # Filter 1m candles to this window — match by timestamp
+        # Candle timestamp is the open time; window candles start at window_open_ts
+        window_candles = [c for c in candles
+                          if window_open_ts <= c.timestamp < window_open_ts + 900]
+        # Sort by timestamp to ensure correct indexing
+        window_candles.sort(key=lambda c: c.timestamp)
 
-        # Helper: find spot price closest to a target timestamp
-        def spot_at(target_ts: float, tol: float = 90) -> Optional[float]:
-            if not window_spots:
-                return None
-            best_ts, best_p = min(window_spots, key=lambda x: abs(x[0] - target_ts))
-            if abs(best_ts - target_ts) <= tol:
-                return best_p
-            return None
-
-        # --- Signal 1: first_5m_dir ---
-        spot_open = spot_at(window_open_ts)
-        spot_5m = spot_at(window_open_ts + 300)
-        if spot_open and spot_5m:
-            f5m_dir = "yes" if spot_5m > spot_open else "no"
+        # --- Signal 1: f5m_dir (first 5 minutes) ---
+        # Match window_logger: candles[0].open vs candles[4].close
+        first5 = window_candles[:5]
+        if len(first5) >= 5:
+            f5m_dir = "yes" if first5[4].close >= first5[0].open else "no"
+        elif len(first5) >= 2:
+            f5m_dir = "yes" if first5[-1].close >= first5[0].open else "no"
         else:
-            f5m_dir = "yes"  # neutral default
+            f5m_dir = "yes"  # neutral default if insufficient data
 
-        # --- Signal 2: first_5m_ofi ---
-        # Use 1m candles within the first 5 min of the window
-        f5m_start = window_open_ts
-        f5m_end = window_open_ts + 300
-        f5m_candles = [c for c in candles
-                       if f5m_start <= c.timestamp <= f5m_end]
-        buy_vol = sum(c.volume for c in f5m_candles if c.is_bullish)
-        sell_vol = sum(c.volume for c in f5m_candles if not c.is_bullish)
-        total_vol = buy_vol + sell_vol
-        f5m_ofi = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0.0
+        # --- Signal 2: f5m_ofi (first 5 min order flow imbalance) ---
+        # Match window_logger: 2 * (sum(taker_buy_vol) / sum(volume)) - 1
+        if first5:
+            f5m_total = sum(c.volume for c in first5)
+            f5m_buy = sum(c.taker_buy_vol for c in first5)
+            f5m_ofi = 2 * (f5m_buy / f5m_total) - 1 if f5m_total > 0 else 0.0
+        else:
+            f5m_ofi = 0.0
 
-        # --- Signal 3: mid_dir ---
-        spot_now = spot_at(now_ts)
-        if spot_5m and spot_now:
-            mid_dir = "yes" if spot_now > spot_5m else "no"
-        elif spot_open and spot_now:
-            mid_dir = "yes" if spot_now > spot_open else "no"
+        # --- Signal 3: mid_dir (mid 5 minutes, candles 5-9) ---
+        # Match window_logger: candles[5].open vs candles[9].close
+        mid5 = window_candles[5:10]
+        if len(mid5) >= 5:
+            mid_dir = "yes" if mid5[4].close >= mid5[0].open else "no"
+        elif len(mid5) >= 2:
+            mid_dir = "yes" if mid5[-1].close >= mid5[0].open else "no"
+        elif len(first5) >= 5 and len(window_candles) > 5:
+            # Have some mid candles but less than 2 — compare last available to first5 close
+            mid_dir = "yes" if window_candles[-1].close >= first5[4].close else "no"
         else:
             mid_dir = "yes"  # neutral default
 
-        # --- Signal 4: taker_buy_ratio ---
-        # Use all 1m candles within the window
-        window_candles = [c for c in candles
-                          if window_open_ts <= c.timestamp <= now_ts]
-        w_buy = sum(c.volume for c in window_candles if c.is_bullish)
-        w_total = sum(c.volume for c in window_candles)
-        taker_buy_ratio = w_buy / w_total if w_total > 0 else 0.5
+        # --- Signal 4: taker_buy_ratio (all window candles) ---
+        # Match window_logger: taker_buy_vol / volume
+        if window_candles:
+            w_total = sum(c.volume for c in window_candles)
+            w_buy = sum(c.taker_buy_vol for c in window_candles)
+            taker_buy_ratio = w_buy / w_total if w_total > 0 else 0.5
+        else:
+            taker_buy_ratio = 0.5
 
         # --- Compute conviction ---
         yes_conv = 0
@@ -391,17 +399,18 @@ class MomentumTracker:
         bb_z = compute_bb_zscore(candles) if len(candles) >= 20 else 0.0
         rsi = compute_rsi(candles) if len(candles) >= 15 else 50.0
 
-        # Spot return
-        if spot_open and spot_now and spot_open > 0:
-            spot_return_pct = (spot_now - spot_open) / spot_open * 100
+        # Spot return — use first candle open vs last candle close
+        if window_candles and window_candles[0].open > 0:
+            spot_return_pct = ((window_candles[-1].close - window_candles[0].open)
+                               / window_candles[0].open * 100)
         else:
             spot_return_pct = 0.0
 
         return MomentumSignal(
             f5m_dir=f5m_dir,
-            f5m_ofi=round(f5m_ofi, 3),
+            f5m_ofi=round(f5m_ofi, 4),
             mid_dir=mid_dir,
-            taker_buy_ratio=round(taker_buy_ratio, 3),
+            taker_buy_ratio=round(taker_buy_ratio, 4),
             yes_conviction=yes_conv,
             no_conviction=no_conv,
             bb_z=round(bb_z, 3),
