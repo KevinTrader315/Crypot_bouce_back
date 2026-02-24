@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Momentum Continuation Bot v3.0
+Momentum Continuation Bot v3.1
 
-Strategy (discovered via signal analysis on 16,639 windows, Feb 2026):
-  At minute 7-10 of a 15-min window, compute a 4-signal conviction score.
-  If 3+ signals agree on a direction, buy that side's contract (45-78c range).
-  Hold to settlement. Stop-loss if conviction collapses AND price drops 15c.
+Strategy (backtested on 16,900 windows, Dec 2025 – Feb 2026):
+  At minute 5-7 of a 15-min window, check first-5m signals.
+  If f5m_dir + f5m_ofi agree AND contract price confirms momentum (>52c),
+  buy that side's contract (40-85c range). Hold to settlement.
 
-Signal conviction (4 signals):
-  1. first_5m_dir — spot direction in first 5 minutes
-  2. first_5m_ofi — order flow imbalance in first 5 minutes
-  3. mid_dir — spot direction at mid-window (5-10 min)
-  4. taker_buy_ratio — ratio of aggressive buyers vs sellers
+Entry signals (available at minute 5):
+  1. first_5m_dir — spot direction in first 5 minutes (candle open/close)
+  2. first_5m_ofi — order flow imbalance using real taker_buy_vol
 
-Win rates from signal discovery:
-  - 4/4 conviction: 77.8% WR, +27.8% edge (N=1292)
-  - 3/4 conviction: ~65% WR, ~+15% edge
+Backtest results (5m entry, f5m+ofi+price confirm, 40-85c):
+  - 240 trades over 77 days, 75.0% WR, +$43.47, ~$0.56/day
 """
 
 import argparse
@@ -44,7 +41,7 @@ from momentum_signals import MomentumTracker, MomentumSignal, fetch_spot_price
 
 logger = logging.getLogger("MomentumBot")
 
-BOT_VERSION = "3.0.0"
+BOT_VERSION = "3.1.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -56,23 +53,26 @@ ASSETS = ["btc", "eth", "sol"]
 @dataclass
 class MomentumConfig:
     """Strategy parameters."""
-    eval_window_min: int = 300     # Start checking at 300s remaining (10 min in)
-    eval_window_max: int = 480     # Last check at 480s remaining (7 min in)
-    min_conviction: int = 3        # Minimum conviction to trade (3 or 4 out of 4)
-    min_entry_price: float = 0.45  # Don't buy below 45c (too cheap = low conviction)
-    max_entry_price: float = 0.78  # Don't buy above 78c (too expensive, bad risk/reward)
+    eval_window_min: int = 480     # Latest entry: 8 min remaining (7 min into window)
+    eval_window_max: int = 600     # Earliest entry: 10 min remaining (5 min into window)
+    min_entry_price: float = 0.40  # Don't buy below 40c
+    max_entry_price: float = 0.85  # Don't buy above 85c
+    min_price_confirm: float = 0.52  # Contract must show momentum (>52c on entry side)
+    ofi_threshold: float = 0.3     # OFI must exceed this to confirm direction
     base_contracts: int = 5
     max_open_positions: int = 3
     stop_loss_enabled: bool = True
-    stop_loss_threshold: float = 0.15  # Exit if price drops 15c AND conviction <=1
-    time_exit_secs: int = 120      # Exit at 2 min remaining if losing
-    time_exit_loss: float = 0.10   # Only time-exit if down >=10c
+    stop_loss_threshold: float = 0.25  # Safety stop-loss at -25c (wide, avoid premature exits)
+    time_exit_secs: int = 0        # Disabled (0 = hold to settlement always)
+    time_exit_loss: float = 0.10   # Only used if time_exit_secs > 0
     mode: str = "paper"
     poll_interval: int = 15
     log_file: str = "data/momentum_trades.jsonl"
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": False
     })
+    # Legacy field kept for compatibility (not used in v3.1 entry logic)
+    min_conviction: int = 2        # f5m_dir + f5m_ofi must agree (2/2)
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +87,9 @@ class MomentumTrade:
     event_ticker: str
     ticker: str
     entry_side: str           # "yes" or "no"
-    entry_price: float        # 0.45-0.78 range (expensive side)
+    entry_price: float        # 0.40-0.85 range (expensive side)
     contracts: int
-    conviction: int           # 3 or 4
+    conviction: int           # full 4-signal conviction (for logging)
     f5m_dir: str
     f5m_ofi: float
     mid_dir: str
@@ -374,32 +374,37 @@ class MomentumBot:
     # ------------------------------------------------------------------
 
     def _check_signal(self, asset: str, event: dict) -> Optional[dict]:
-        """Check if momentum continuation signal is present.
+        """Check if momentum continuation signal is present (v3.1).
 
-        Signal logic:
-          1. Refresh spot data and record spot tick for this window
-          2. Compute 4-signal conviction at 7-10 min into window
-          3. If conviction >= min_conviction, check contract price is in 45-78c range
+        Signal logic (5-min entry):
+          1. Refresh candle data (Binance 1m with taker_buy_vol)
+          2. Check f5m_dir + f5m_ofi agree on direction
+          3. Check contract price confirms momentum (>52c on entry side)
+          4. Check price is in 40-85c range
         """
         event_ticker = event['event_ticker']
         close_ts = event['close_ts']
         window_open_ts = close_ts - 900  # 15-min window
         now_ts = time.time()
 
-        # Refresh spot data
+        # Refresh candle + spot data
         self.momentum_tracker.refresh(asset)
         spot = self.momentum_tracker.get_spot(asset)
         if spot:
             self.momentum_tracker.record_spot(asset, spot, now_ts)
 
-        # Compute momentum signal
+        # Compute all signals (for logging), but entry uses only f5m_dir + f5m_ofi
         signal = self.momentum_tracker.compute_signal(
             asset, window_open_ts, now_ts)
 
-        if signal.direction == "none":
-            return None
-
-        if signal.conviction < self.config.min_conviction:
+        # --- V3.1 entry decision: f5m_dir + f5m_ofi must agree ---
+        ofi_thresh = self.config.ofi_threshold
+        if signal.f5m_dir == "yes" and signal.f5m_ofi > ofi_thresh:
+            entry_side = "yes"
+        elif signal.f5m_dir == "no" and signal.f5m_ofi < -ofi_thresh:
+            entry_side = "no"
+        else:
+            # f5m_dir and f5m_ofi don't agree — no trade
             return None
 
         self._stats['signals'] += 1
@@ -409,35 +414,37 @@ class MomentumBot:
         if now_price is None:
             return None
 
-        # Determine entry side and check price range
-        entry_side = signal.direction
+        # Calculate entry-side price
         min_cents = self.config.min_entry_price * 100
         max_cents = self.config.max_entry_price * 100
+        confirm_cents = self.config.min_price_confirm * 100
 
         if entry_side == 'yes':
-            # Buy YES — check YES price is in 45-78c range
-            if not (min_cents <= now_price <= max_cents):
-                logger.debug("%s Conv %d/4 YES but price %.0fc outside %.0f-%.0fc",
-                             asset.upper(), signal.conviction,
-                             now_price, min_cents, max_cents)
-                return None
-            entry_price = now_price / 100
+            entry_cents = now_price
         else:
-            # Buy NO — check NO price (100 - YES) is in 45-78c range
-            no_price = 100 - now_price
-            if not (min_cents <= no_price <= max_cents):
-                logger.debug("%s Conv %d/4 NO but price %.0fc outside %.0f-%.0fc",
-                             asset.upper(), signal.conviction,
-                             no_price, min_cents, max_cents)
-                return None
-            entry_price = no_price / 100
+            entry_cents = 100 - now_price
+
+        # Price confirmation: contract must show momentum (>52c on entry side)
+        if entry_cents < confirm_cents:
+            logger.debug("%s f5m signals agree %s but price %.0fc < %.0fc confirm",
+                         asset.upper(), entry_side.upper(), entry_cents, confirm_cents)
+            return None
+
+        # Price range check
+        if not (min_cents <= entry_cents <= max_cents):
+            logger.debug("%s f5m signals agree %s but price %.0fc outside %.0f-%.0fc",
+                         asset.upper(), entry_side.upper(),
+                         entry_cents, min_cents, max_cents)
+            return None
+
+        entry_price = entry_cents / 100
 
         return {
             'asset': asset,
             'event_ticker': event_ticker,
             'entry_side': entry_side,
             'entry_price': entry_price,
-            'conviction': signal.conviction,
+            'conviction': signal.conviction,  # Full 4-signal conviction (for logging)
             'signal': signal,
             'secs_left': event['secs_left'],
             'spot_price': spot,
@@ -554,18 +561,12 @@ class MomentumBot:
             secs_left = close_ts - now_ts
             price_drop = entry_cents - our_price_cents
 
-            # --- Stop-loss check ---
+            # --- Stop-loss check (v3.1: pure price-based, no conviction recheck) ---
             if (self.config.stop_loss_enabled
                     and price_drop >= self.config.stop_loss_threshold * 100):
-                # Recalculate conviction
-                try:
-                    fresh_signal = self.momentum_tracker.compute_signal(
-                        trade.asset, window_open_ts, now_ts)
-                    current_conv = fresh_signal.conviction
-                except Exception:
-                    current_conv = trade.conviction  # keep original if compute fails
-
-                if current_conv <= 1:
+                # Safety stop: exit if price dropped beyond threshold
+                current_conv = trade.conviction  # logged for reference
+                if True:  # always trigger at threshold
                     exit_price = our_price_cents / 100
                     fee = kalshi_fee(trade.entry_price)
                     trade.pnl_net = (exit_price - trade.entry_price - fee) * trade.contracts
@@ -593,8 +594,9 @@ class MomentumBot:
                     )
                     return
 
-            # --- Time exit check ---
-            if (secs_left <= self.config.time_exit_secs
+            # --- Time exit check (disabled when time_exit_secs == 0) ---
+            if (self.config.time_exit_secs > 0
+                    and secs_left <= self.config.time_exit_secs
                     and price_drop >= self.config.time_exit_loss * 100):
                 exit_price = our_price_cents / 100
                 fee = kalshi_fee(trade.entry_price)
@@ -806,10 +808,10 @@ class MomentumBot:
 
             msig = signal['signal']
             logger.info(
-                "%s SIGNAL: conv=%d/4 -> %s @%.0fc  f5m=%s ofi=%.2f mid=%s tbr=%.2f  bb=%.1f rsi=%.0f  %ds left",
-                asset.upper(), msig.conviction, signal['entry_side'].upper(),
-                signal['entry_price'] * 100,
-                msig.f5m_dir, msig.f5m_ofi, msig.mid_dir, msig.taker_buy_ratio,
+                "%s SIGNAL: f5m=%s ofi=%.3f -> %s @%.0fc  (mid=%s tbr=%.3f bb=%.1f rsi=%.0f)  %ds left",
+                asset.upper(), msig.f5m_dir, msig.f5m_ofi,
+                signal['entry_side'].upper(), signal['entry_price'] * 100,
+                msig.mid_dir, msig.taker_buy_ratio,
                 msig.bb_z, msig.rsi,
                 int(signal['secs_left'])
             )
@@ -912,12 +914,13 @@ class MomentumBot:
     def run(self):
         self.running = True
         logger.info("Momentum Bot v%s started (%s mode)", BOT_VERSION, self.config.mode)
-        logger.info("Assets: %s  Entry: %.0f-%.0fc  Conviction: %d+/4  Stop-loss: %s  Window: %d-%ds",
+        logger.info("Assets: %s  Entry: %.0f-%.0fc  Confirm: >%.0fc  OFI: >%.1f  Stop: %s  Window: %d-%ds",
                     [a for a, e in self.config.enabled_assets.items() if e],
                     self.config.min_entry_price * 100,
                     self.config.max_entry_price * 100,
-                    self.config.min_conviction,
-                    "ON" if self.config.stop_loss_enabled else "OFF",
+                    self.config.min_price_confirm * 100,
+                    self.config.ofi_threshold,
+                    "ON(-%.0fc)" % (self.config.stop_loss_threshold * 100) if self.config.stop_loss_enabled else "OFF",
                     self.config.eval_window_min,
                     self.config.eval_window_max)
         while self.running:
