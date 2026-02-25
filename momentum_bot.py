@@ -72,7 +72,7 @@ class MomentumConfig:
     poll_interval: int = 15
     log_file: str = "data/momentum_trades.jsonl"
     enabled_assets: dict = field(default_factory=lambda: {
-        "btc": True, "eth": True, "sol": False
+        "btc": True, "eth": True, "sol": True
     })
     min_conviction: int = 4        # Min signals that must agree (4=all: f5m+ofi+mid+tbr)
     kill_hours: list = field(default_factory=lambda: [20, 21])  # UTC hours to skip (0% WR in live data)
