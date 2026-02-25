@@ -79,9 +79,30 @@ async function syncStatus() {
     const d = await r.json();
     updateBtn(d.trading_enabled !== false);
     updateModeBtn(d.mode || 'paper');
-    const inp = document.getElementById('contractsInput');
-    if (inp && d.base_contracts != null) inp.value = d.base_contracts;
+    renderConfig(d);
   } catch(e) {}
+}
+function renderConfig(d) {
+  const el = document.getElementById('config-card');
+  if (!el) return;
+  const assets = d.enabled_assets
+    ? Object.entries(d.enabled_assets).filter(([,v])=>v).map(([k])=>k.toUpperCase()).join(', ')
+    : '—';
+  const killHours = (d.kill_hours && d.kill_hours.length)
+    ? d.kill_hours.map(h=>h+'h UTC').join(', ')
+    : 'none';
+  const earlyMins = d.early_window_secs ? (15 - d.early_window_secs/60).toFixed(0) : '3';
+  el.innerHTML =
+    '<div class="stat"><span class="stat-l">Trade Size</span><span class="stat-v" style="color:var(--accent)">$'+(d.trade_dollars||'—')+' / trade</span></div>'+
+    '<div class="stat"><span class="stat-l">Assets</span><span class="stat-v">'+assets+'</span></div>'+
+    '<div class="stat"><span class="stat-l">Min Conviction</span><span class="stat-v" style="color:var(--green)">'+(d.min_conviction||4)+'/4</span></div>'+
+    '<div class="stat"><span class="stat-l">Entry Range</span><span class="stat-v">'+Math.round((d.min_entry_price||0.4)*100)+'-'+Math.round((d.max_entry_price||0.85)*100)+'c</span></div>'+
+    '<div class="stat"><span class="stat-l">Price Confirm</span><span class="stat-v">&gt;'+Math.round((d.min_price_confirm||0.5)*100)+'c</span></div>'+
+    '<div class="stat"><span class="stat-l">OFI 5m / 3m</span><span class="stat-v">&gt;'+(d.ofi_threshold||0.3)+' / &gt;'+(d.early_ofi_threshold||0.5)+'</span></div>'+
+    '<div class="stat"><span class="stat-l">Early Entry</span><span class="stat-v" style="color:var(--accent)">min '+earlyMins+' ('+(d.early_window_secs||720)+'s left)</span></div>'+
+    '<div class="stat"><span class="stat-l">Kill Hours</span><span class="stat-v" style="color:var(--red)">'+killHours+'</span></div>'+
+    '<div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:'+(d.stop_loss_enabled?'var(--green)':'var(--red)')+'">'+(d.stop_loss_enabled?'ON (conv&lt;4 only)':'OFF')+'</span></div>'+
+    '<div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">'+(d.max_open_positions||3)+'</span></div>';
 }
 window.addEventListener('DOMContentLoaded', () => { syncStatus(); startAutoRefresh(); });
 
@@ -458,29 +479,12 @@ function startAutoRefresh() {
   </div>
   <div class="card">
     <h3>Config</h3>
-    <div class="stat"><span class="stat-l">Eval Window</span><span class="stat-v">{{ eval_min }}-{{ eval_max }}s left (7-10m in)</span></div>
-    <div class="stat"><span class="stat-l">Min Conviction</span><span class="stat-v" style="color:var(--green)">{{ min_conv }}/4</span></div>
-    <div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:{{ 'var(--green)' if stop_loss else 'var(--red)' }}">{{ 'ON (conv&lt;4 only)' if stop_loss else 'OFF' }}</span></div>
-    <div class="stat">
-      <span class="stat-l">Base Contracts</span>
-      <span class="stat-v" style="display:flex;align-items:center;gap:.4rem">
-        <input id="contractsInput" type="number" min="1" max="50" value="{{ contracts }}"
-          style="width:3.5rem;background:#0d1117;border:1px solid #30363d;border-radius:4px;
-                 color:#e6edf3;font-family:monospace;font-size:.8rem;padding:1px 4px;text-align:center">
-        <button onclick="saveContracts()" style="padding:1px 8px;border-radius:4px;cursor:pointer;
-          font-family:monospace;font-size:.75rem;border:1px solid #30363d;background:#161b22;color:#58a6ff">
-          Save</button>
-        <span id="contractsFb" style="font-size:.7rem;color:var(--dim)"></span>
-      </span>
-    </div>
-    <div class="stat"><span class="stat-l">Entry Range</span><span class="stat-v">{{ min_entry }}-{{ max_entry }}c (expensive side)</span></div>
-    <div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">{{ max_open }}</span></div>
-    <div class="stat"><span class="stat-l">Assets</span><span class="stat-v">{{ assets }}</span></div>
+    <div id="config-card"><div style="color:var(--dim);font-size:.75rem">Loading...</div></div>
   </div>
   <div class="card" style="grid-column:1/-1">
     <div class="tl-legend">
       <span><svg width="20" height="8"><rect x="0" y="0" width="20" height="8" fill="rgba(88,166,255,0.15)" stroke="rgba(88,166,255,0.4)" stroke-width="1"/></svg> Eval window (7-10m into window)</span>
-      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.4)" stroke-width="1" stroke-dasharray="2,4"/></svg> {{ min_entry }}-{{ max_entry }}c entry zone</span>
+      <span><svg width="20" height="8"><line x1="0" y1="4" x2="20" y2="4" stroke="rgba(63,185,80,0.4)" stroke-width="1" stroke-dasharray="2,4"/></svg> 40-85c entry zone</span>
       <span><svg width="8" height="8"><polygon points="4,0 8,8 0,8" fill="#3fb950"/></svg> Trade entry (conv 3-4/4)</span>
     </div>
   </div>
@@ -583,6 +587,9 @@ def api_status():
         "eval_window_min": bot.config.eval_window_min,
         "eval_window_max": bot.config.eval_window_max,
         "max_open_positions": bot.config.max_open_positions,
+        "enabled_assets": bot.config.enabled_assets,
+        "early_window_secs": bot.config.early_window_secs,
+        "early_ofi_threshold": bot.config.early_ofi_threshold,
     })
 
 
