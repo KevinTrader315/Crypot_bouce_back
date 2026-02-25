@@ -8,9 +8,12 @@ if [ -n "$KALSHI_PRIVATE_KEY" ]; then
     export KALSHI_PRIVATE_KEY_PATH=/app/kalshi_key.pem
 fi
 
-CONV_FLAG=""
-if [ -n "${MIN_CONVICTION:-}" ]; then
-    CONV_FLAG="--min-conviction ${MIN_CONVICTION}"
+DOLLARS_FLAG="--trade-dollars ${TRADE_DOLLARS:-15}"
+CONV_FLAG="--min-conviction ${MIN_CONVICTION:-4}"
+
+KILL_FLAG=""
+if [ -n "${KILL_HOURS:-}" ]; then
+    KILL_FLAG="--kill-hours ${KILL_HOURS}"
 fi
 
 SL_FLAG=""
@@ -23,5 +26,7 @@ exec python3 dashboard.py \
   --contracts "${CONTRACTS:-5}" \
   --port 5052 \
   --poll "${POLL_INTERVAL:-15}" \
+  $DOLLARS_FLAG \
   $CONV_FLAG \
-  $SL_FLAG
+  $SL_FLAG \
+  $KILL_FLAG

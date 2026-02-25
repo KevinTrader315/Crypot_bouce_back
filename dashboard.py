@@ -571,6 +571,7 @@ def api_status():
         "stats": bot._stats,
         "open_trades": len(bot.trade_log.get_open()),
         # Live config
+        "trade_dollars": bot.config.trade_dollars,
         "base_contracts": bot.config.base_contracts,
         "min_entry_price": bot.config.min_entry_price,
         "max_entry_price": bot.config.max_entry_price,
@@ -578,6 +579,7 @@ def api_status():
         "ofi_threshold": bot.config.ofi_threshold,
         "min_price_confirm": bot.config.min_price_confirm,
         "stop_loss_enabled": bot.config.stop_loss_enabled,
+        "kill_hours": bot.config.kill_hours,
         "eval_window_min": bot.config.eval_window_min,
         "eval_window_max": bot.config.eval_window_max,
         "max_open_positions": bot.config.max_open_positions,
@@ -633,8 +635,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--min-conviction", type=int, default=3,
-                        help="Minimum conviction score (3 or 4)")
+    parser.add_argument("--trade-dollars", type=float, default=15.0,
+                        help="Target spend per trade in dollars")
+    parser.add_argument("--min-conviction", type=int, default=4,
+                        help="Minimum conviction score (default 4 = all signals agree)")
+    parser.add_argument("--kill-hours", type=str, default="",
+                        help="Comma-separated UTC hours to skip, e.g. '20,21'")
     parser.add_argument("--no-stop-loss", action="store_true",
                         help="Disable stop-loss exits")
     parser.add_argument("--port", type=int, default=5052)
@@ -657,10 +663,14 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning("Auth failed: %s — live mode toggle will be unavailable", e)
 
+    kill_hours = [int(h.strip()) for h in args.kill_hours.split(",") if h.strip()] if args.kill_hours else [20, 21]
+
     config = MomentumConfig(
         mode=args.mode,
+        trade_dollars=args.trade_dollars,
         base_contracts=args.contracts,
         min_conviction=args.min_conviction,
+        kill_hours=kill_hours,
         stop_loss_enabled=not args.no_stop_loss,
         poll_interval=args.poll,
     )

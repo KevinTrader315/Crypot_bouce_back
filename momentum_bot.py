@@ -59,7 +59,8 @@ class MomentumConfig:
     max_entry_price: float = 0.85  # Don't buy above 85c
     min_price_confirm: float = 0.52  # Contract must show momentum (>52c on entry side)
     ofi_threshold: float = 0.3     # OFI must exceed this to confirm direction
-    base_contracts: int = 5
+    trade_dollars: float = 15.0    # Target spend per trade; contracts = floor(trade_dollars / entry_price)
+    base_contracts: int = 5        # Fallback if trade_dollars is 0
     max_open_positions: int = 3
     stop_loss_enabled: bool = True
     stop_loss_threshold: float = 0.25  # Safety stop-loss at -25c (wide, avoid premature exits)
@@ -71,8 +72,8 @@ class MomentumConfig:
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": False
     })
-    # Legacy field kept for compatibility (not used in v3.1 entry logic)
-    min_conviction: int = 2        # f5m_dir + f5m_ofi must agree (2/2)
+    min_conviction: int = 4        # Min signals that must agree (4=all: f5m+ofi+mid+tbr)
+    kill_hours: list = field(default_factory=lambda: [20, 21])  # UTC hours to skip (0% WR in live data)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +398,20 @@ class MomentumBot:
         signal = self.momentum_tracker.compute_signal(
             asset, window_open_ts, now_ts)
 
+        # UTC hour kill switch — skip windows where live data shows 0% WR
+        utc_hour = datetime.now(timezone.utc).hour
+        if utc_hour in self.config.kill_hours:
+            logger.debug("%s Kill hour %d — skipping", asset.upper(), utc_hour)
+            return None
+
+        # Conviction gate: all 4 signals must agree (mid_dir + taker_buy_ratio confirm)
+        # Live data: conv=4 → 79.2% WR +$28; conv=3 → 51.2% WR -$11 (unprofitable after fees)
+        if signal.conviction < self.config.min_conviction:
+            logger.debug("%s Conviction %d < %d required — skipping (mid=%s tbr=%.3f)",
+                         asset.upper(), signal.conviction, self.config.min_conviction,
+                         signal.mid_dir, signal.taker_buy_ratio)
+            return None
+
         # --- V3.1 entry decision: f5m_dir + f5m_ofi must agree ---
         ofi_thresh = self.config.ofi_threshold
         if signal.f5m_dir == "yes" and signal.f5m_ofi > ofi_thresh:
@@ -460,9 +475,15 @@ class MomentumBot:
         entry_price = signal['entry_price']
         msig = signal['signal']
 
+        # Dollar-based sizing: contracts = floor(trade_dollars / entry_price), min 1
+        if self.config.trade_dollars > 0:
+            contracts = max(1, int(self.config.trade_dollars / entry_price))
+        else:
+            contracts = self.config.base_contracts
+
         # Capital guard
-        investment_cents = int(self.config.base_contracts * entry_price * 100)
-        exposure_cents = int(len(self.trade_log.get_open()) * self.config.base_contracts * entry_price * 100)
+        investment_cents = int(contracts * entry_price * 100)
+        exposure_cents = int(len(self.trade_log.get_open()) * contracts * entry_price * 100)
         allowed, reason = self.capital_guard.check_order(investment_cents, exposure_cents)
         if not allowed:
             logger.info("%s Signal blocked by capital guard: %s", asset.upper(), reason)
@@ -474,7 +495,6 @@ class MomentumBot:
             return
 
         ticker = market.get('ticker', '')
-        contracts = self.config.base_contracts
         trade_id = f"{asset}_{signal['event_ticker']}_{int(time.time())}"
 
         if self.config.mode == 'live' and self.trader:
@@ -940,8 +960,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Momentum Bot")
     parser.add_argument("--mode", choices=["paper", "live", "monitor"], default="paper")
     parser.add_argument("--contracts", type=int, default=5)
-    parser.add_argument("--min-conviction", type=int, default=3,
-                        help="Minimum conviction score (3 or 4)")
+    parser.add_argument("--trade-dollars", type=float, default=15.0,
+                        help="Target spend per trade in dollars (contracts = floor(dollars / entry_price))")
+    parser.add_argument("--min-conviction", type=int, default=4,
+                        help="Minimum conviction score (default 4 = all signals agree)")
+    parser.add_argument("--kill-hours", type=str, default="",
+                        help="Comma-separated UTC hours to skip, e.g. '20,21'")
     parser.add_argument("--no-stop-loss", action="store_true",
                         help="Disable stop-loss exits")
     parser.add_argument("--poll", type=int, default=15)
@@ -964,10 +988,14 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("Auth failed: %s — falling back to paper", e)
 
+    kill_hours = [int(h.strip()) for h in args.kill_hours.split(",") if h.strip()] if args.kill_hours else [20, 21]
+
     config = MomentumConfig(
         mode=args.mode,
+        trade_dollars=args.trade_dollars,
         base_contracts=args.contracts,
         min_conviction=args.min_conviction,
+        kill_hours=kill_hours,
         stop_loss_enabled=not args.no_stop_loss,
         poll_interval=args.poll,
     )
