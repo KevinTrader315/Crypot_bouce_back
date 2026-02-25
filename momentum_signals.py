@@ -85,6 +85,11 @@ class MomentumSignal:
     rsi: float             # RSI value
     spot_return_pct: float # Spot return in the window so far
 
+    # Early-entry signals (available at minute 3, cheaper entry price)
+    # Must come last — have defaults so can't precede non-default fields
+    f3m_dir: str = ""      # first 3m direction — available at minute 3
+    f3m_ofi: float = 0.0   # first 3m OFI — higher threshold needed (fewer candles)
+
     @property
     def direction(self) -> str:
         """Which side has conviction."""
@@ -345,6 +350,24 @@ class MomentumTracker:
         else:
             f5m_ofi = 0.0
 
+        # --- Early signals: f3m_dir + f3m_ofi (first 3 minutes) ---
+        # Available at minute 3 (vs minute 5 for f5m), giving ~8c cheaper entry.
+        # Data: minute-3 entry → +5.4c/contract avg; minute-5 → -1.3c/contract.
+        first3 = window_candles[:3]
+        if len(first3) >= 3:
+            f3m_dir = "yes" if first3[2].close >= first3[0].open else "no"
+        elif len(first3) >= 2:
+            f3m_dir = "yes" if first3[-1].close >= first3[0].open else "no"
+        else:
+            f3m_dir = ""  # not enough data yet
+
+        if first3:
+            f3m_total = sum(c.volume for c in first3)
+            f3m_buy = sum(c.taker_buy_vol for c in first3)
+            f3m_ofi = 2 * (f3m_buy / f3m_total) - 1 if f3m_total > 0 else 0.0
+        else:
+            f3m_ofi = 0.0
+
         # --- Signal 3: mid_dir (mid 5 minutes, candles 5-9) ---
         # Match window_logger: candles[5].open vs candles[9].close
         mid5 = window_candles[5:10]
@@ -411,6 +434,8 @@ class MomentumTracker:
             f5m_ofi=round(f5m_ofi, 4),
             mid_dir=mid_dir,
             taker_buy_ratio=round(taker_buy_ratio, 4),
+            f3m_dir=f3m_dir,
+            f3m_ofi=round(f3m_ofi, 4),
             yes_conviction=yes_conv,
             no_conviction=no_conv,
             bb_z=round(bb_z, 3),

@@ -41,7 +41,7 @@ from momentum_signals import MomentumTracker, MomentumSignal, fetch_spot_price
 
 logger = logging.getLogger("MomentumBot")
 
-BOT_VERSION = "3.1.0"
+BOT_VERSION = "3.2.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -54,11 +54,13 @@ ASSETS = ["btc", "eth", "sol"]
 class MomentumConfig:
     """Strategy parameters."""
     eval_window_min: int = 480     # Latest entry: 8 min remaining (7 min into window)
-    eval_window_max: int = 600     # Earliest entry: 10 min remaining (5 min into window)
+    eval_window_max: int = 840     # Earliest entry: 14 min remaining (1 min into window) — expanded for early entry
     min_entry_price: float = 0.40  # Don't buy below 40c
     max_entry_price: float = 0.85  # Don't buy above 85c
-    min_price_confirm: float = 0.52  # Contract must show momentum (>52c on entry side)
-    ofi_threshold: float = 0.3     # OFI must exceed this to confirm direction
+    min_price_confirm: float = 0.50  # Contract must show momentum (>50c on entry side; lowered from 52c for earlier entries)
+    ofi_threshold: float = 0.3     # OFI threshold for 5m signal
+    early_ofi_threshold: float = 0.5  # Higher OFI threshold for 3m signal (fewer candles, need stronger confirmation)
+    early_window_secs: int = 720   # Enter using 3m signal when secs_left > this (minute 3+)
     trade_dollars: float = 15.0    # Target spend per trade; contracts = floor(trade_dollars / entry_price)
     base_contracts: int = 5        # Fallback if trade_dollars is 0
     max_open_positions: int = 3
@@ -375,13 +377,13 @@ class MomentumBot:
     # ------------------------------------------------------------------
 
     def _check_signal(self, asset: str, event: dict) -> Optional[dict]:
-        """Check if momentum continuation signal is present (v3.1).
+        """Check if momentum continuation signal is present (v3.2).
 
-        Signal logic (5-min entry):
-          1. Refresh candle data (Binance 1m with taker_buy_vol)
-          2. Check f5m_dir + f5m_ofi agree on direction
-          3. Check contract price confirms momentum (>52c on entry side)
-          4. Check price is in 40-85c range
+        Signal logic — two entry paths:
+          EARLY (minute 2-3, secs_left > 720): use f3m_dir + f3m_ofi (OFI > 0.5).
+            Bypasses conviction gate since mid_dir unavailable. ~8c cheaper entry.
+          STANDARD (minute 5+, secs_left <= 720): use conviction gate (all 4 agree)
+            then f5m_dir + f5m_ofi (OFI > 0.3).
         """
         event_ticker = event['event_ticker']
         close_ts = event['close_ts']
@@ -398,29 +400,45 @@ class MomentumBot:
         signal = self.momentum_tracker.compute_signal(
             asset, window_open_ts, now_ts)
 
-        # UTC hour kill switch — skip windows where live data shows 0% WR
+        # UTC hour kill switch — skip windows where live data shows 0% WR (applies to all paths)
         utc_hour = datetime.now(timezone.utc).hour
         if utc_hour in self.config.kill_hours:
             logger.debug("%s Kill hour %d — skipping", asset.upper(), utc_hour)
             return None
 
-        # Conviction gate: all 4 signals must agree (mid_dir + taker_buy_ratio confirm)
-        # Live data: conv=4 → 79.2% WR +$28; conv=3 → 51.2% WR -$11 (unprofitable after fees)
-        if signal.conviction < self.config.min_conviction:
-            logger.debug("%s Conviction %d < %d required — skipping (mid=%s tbr=%.3f)",
-                         asset.upper(), signal.conviction, self.config.min_conviction,
-                         signal.mid_dir, signal.taker_buy_ratio)
-            return None
-
-        # --- V3.1 entry decision: f5m_dir + f5m_ofi must agree ---
-        ofi_thresh = self.config.ofi_threshold
-        if signal.f5m_dir == "yes" and signal.f5m_ofi > ofi_thresh:
-            entry_side = "yes"
-        elif signal.f5m_dir == "no" and signal.f5m_ofi < -ofi_thresh:
-            entry_side = "no"
+        # --- V3.2 entry decision: early (3m) or standard (5m) path ---
+        secs_left = event['secs_left']
+        if secs_left > self.config.early_window_secs and signal.f3m_dir:
+            # Early entry (minute 2-3): use 3m OFI, bypass conviction gate
+            # Data: +5.4c/contract avg at minute 3 vs -1.3c at minute 5
+            ofi = signal.f3m_ofi
+            if signal.f3m_dir == "yes" and ofi >= self.config.early_ofi_threshold:
+                entry_side = "yes"
+            elif signal.f3m_dir == "no" and ofi <= -self.config.early_ofi_threshold:
+                entry_side = "no"
+            else:
+                logger.debug("%s Early entry: 3m signal weak (f3m=%s ofi=%.3f < %.1f)",
+                             asset.upper(), signal.f3m_dir, abs(ofi),
+                             self.config.early_ofi_threshold)
+                return None
+            entry_type = "early_3m"
         else:
-            # f5m_dir and f5m_ofi don't agree — no trade
-            return None
+            # Standard entry (minute 5+): require all 4 signals to agree
+            # Live data: conv=4 → 79.2% WR +$28; conv=3 → 51.2% WR -$11 (unprofitable after fees)
+            if signal.conviction < self.config.min_conviction:
+                logger.debug("%s Conviction %d < %d required — skipping (mid=%s tbr=%.3f)",
+                             asset.upper(), signal.conviction, self.config.min_conviction,
+                             signal.mid_dir, signal.taker_buy_ratio)
+                return None
+
+            ofi_thresh = self.config.ofi_threshold
+            if signal.f5m_dir == "yes" and signal.f5m_ofi > ofi_thresh:
+                entry_side = "yes"
+            elif signal.f5m_dir == "no" and signal.f5m_ofi < -ofi_thresh:
+                entry_side = "no"
+            else:
+                return None
+            entry_type = "f5m"
 
         self._stats['signals'] += 1
 
@@ -458,6 +476,7 @@ class MomentumBot:
             'asset': asset,
             'event_ticker': event_ticker,
             'entry_side': entry_side,
+            'entry_type': entry_type,
             'entry_price': entry_price,
             'conviction': signal.conviction,  # Full 4-signal conviction (for logging)
             'signal': signal,
@@ -528,6 +547,7 @@ class MomentumBot:
             entry_time=datetime.now(timezone.utc).isoformat(),
             close_time=datetime.fromtimestamp(
                 event['close_ts'], tz=timezone.utc).isoformat(),
+            notes=signal.get('entry_type', ''),
         )
         self.trade_log.save(trade)
         self._entered_windows.add(signal['event_ticker'])
@@ -829,8 +849,9 @@ class MomentumBot:
 
             msig = signal['signal']
             logger.info(
-                "%s SIGNAL: f5m=%s ofi=%.3f -> %s @%.0fc  (mid=%s tbr=%.3f bb=%.1f rsi=%.0f)  %ds left",
-                asset.upper(), msig.f5m_dir, msig.f5m_ofi,
+                "%s SIGNAL [%s]: f3m=%s/%.3f f5m=%s/%.3f -> %s @%.0fc  (mid=%s tbr=%.3f bb=%.1f rsi=%.0f)  %ds left",
+                asset.upper(), signal.get('entry_type', '?'),
+                msig.f3m_dir, msig.f3m_ofi, msig.f5m_dir, msig.f5m_ofi,
                 signal['entry_side'].upper(), signal['entry_price'] * 100,
                 msig.mid_dir, msig.taker_buy_ratio,
                 msig.bb_z, msig.rsi,
