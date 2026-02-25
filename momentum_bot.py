@@ -75,7 +75,8 @@ class MomentumConfig:
         "btc": True, "eth": True, "sol": True
     })
     min_conviction: int = 4        # Min signals that must agree (4=all: f5m+ofi+mid+tbr)
-    kill_hours: list = field(default_factory=lambda: [20, 21])  # UTC hours to skip (0% WR in live data)
+    kill_hours: list = field(default_factory=lambda: [18, 19, 23])  # UTC hours to skip — 19h=0% WR, 23h=0%, 18h=33%; 20-21h were 100% WR so removed
+    spot_move_bypass_pct: float = 0.15  # If spot moved >0.15% in first 5m → skip price confirm (100% WR on 80 signals)
 
 
 # ---------------------------------------------------------------------------
@@ -457,10 +458,15 @@ class MomentumBot:
         else:
             entry_cents = 100 - now_price
 
-        # Price confirmation: contract must show momentum (>52c on entry side)
-        if entry_cents < confirm_cents:
-            logger.debug("%s f5m signals agree %s but price %.0fc < %.0fc confirm",
-                         asset.upper(), entry_side.upper(), entry_cents, confirm_cents)
+        # Strong spot move bypass: if spot moved >0.15% in first 5m, skip price confirm
+        # Data: first_5m_move_pct > 0.15% → 100% WR on 80 signals (vs 77.7% overall)
+        strong_move = abs(signal.spot_return_pct) >= self.config.spot_move_bypass_pct
+
+        # Price confirmation: contract must show momentum (>50c on entry side)
+        if entry_cents < confirm_cents and not strong_move:
+            logger.debug("%s signals agree %s but price %.0fc < %.0fc confirm (spot_move=%.3f%%)",
+                         asset.upper(), entry_side.upper(), entry_cents, confirm_cents,
+                         signal.spot_return_pct)
             return None
 
         # Price range check
@@ -478,7 +484,8 @@ class MomentumBot:
             'entry_side': entry_side,
             'entry_type': entry_type,
             'entry_price': entry_price,
-            'conviction': signal.conviction,  # Full 4-signal conviction (for logging)
+            'conviction': signal.conviction,
+            'strong_move': strong_move,
             'signal': signal,
             'secs_left': event['secs_left'],
             'spot_price': spot,
@@ -848,13 +855,14 @@ class MomentumBot:
                 continue
 
             msig = signal['signal']
+            bypass_tag = ' [MOVE_BYPASS]' if signal.get('strong_move') else ''
             logger.info(
-                "%s SIGNAL [%s]: f3m=%s/%.3f f5m=%s/%.3f -> %s @%.0fc  (mid=%s tbr=%.3f bb=%.1f rsi=%.0f)  %ds left",
-                asset.upper(), signal.get('entry_type', '?'),
+                "%s SIGNAL [%s%s]: f3m=%s/%.3f f5m=%s/%.3f -> %s @%.0fc  (mid=%s tbr=%.3f spot=%.3f%% bb=%.1f)  %ds left",
+                asset.upper(), signal.get('entry_type', '?'), bypass_tag,
                 msig.f3m_dir, msig.f3m_ofi, msig.f5m_dir, msig.f5m_ofi,
                 signal['entry_side'].upper(), signal['entry_price'] * 100,
                 msig.mid_dir, msig.taker_buy_ratio,
-                msig.bb_z, msig.rsi,
+                msig.spot_return_pct, msig.bb_z,
                 int(signal['secs_left'])
             )
             if not self.trading_enabled:
@@ -1009,7 +1017,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("Auth failed: %s — falling back to paper", e)
 
-    kill_hours = [int(h.strip()) for h in args.kill_hours.split(",") if h.strip()] if args.kill_hours else [20, 21]
+    kill_hours = [int(h.strip()) for h in args.kill_hours.split(",") if h.strip()] if args.kill_hours else [18, 19, 23]
 
     config = MomentumConfig(
         mode=args.mode,

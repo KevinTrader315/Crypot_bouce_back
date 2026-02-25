@@ -100,6 +100,7 @@ function renderConfig(d) {
     '<div class="stat"><span class="stat-l">Price Confirm</span><span class="stat-v">&gt;'+Math.round((d.min_price_confirm||0.5)*100)+'c</span></div>'+
     '<div class="stat"><span class="stat-l">OFI 5m / 3m</span><span class="stat-v">&gt;'+(d.ofi_threshold||0.3)+' / &gt;'+(d.early_ofi_threshold||0.5)+'</span></div>'+
     '<div class="stat"><span class="stat-l">Early Entry</span><span class="stat-v" style="color:var(--accent)">min '+earlyMins+' ('+(d.early_window_secs||720)+'s left)</span></div>'+
+    '<div class="stat"><span class="stat-l">Move Bypass</span><span class="stat-v" style="color:var(--green)">&gt;'+(d.spot_move_bypass_pct||0.15)+'% spot → skip confirm</span></div>'+
     '<div class="stat"><span class="stat-l">Kill Hours</span><span class="stat-v" style="color:var(--red)">'+killHours+'</span></div>'+
     '<div class="stat"><span class="stat-l">Stop-Loss</span><span class="stat-v" style="color:'+(d.stop_loss_enabled?'var(--green)':'var(--red)')+'">'+(d.stop_loss_enabled?'ON (conv&lt;4 only)':'OFF')+'</span></div>'+
     '<div class="stat"><span class="stat-l">Max Open</span><span class="stat-v">'+(d.max_open_positions||3)+'</span></div>';
@@ -590,6 +591,7 @@ def api_status():
         "enabled_assets": bot.config.enabled_assets,
         "early_window_secs": bot.config.early_window_secs,
         "early_ofi_threshold": bot.config.early_ofi_threshold,
+        "spot_move_bypass_pct": bot.config.spot_move_bypass_pct,
     })
 
 
