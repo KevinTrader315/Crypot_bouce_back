@@ -22,7 +22,7 @@ import os
 import time
 import threading
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -70,7 +70,7 @@ class MomentumConfig:
     time_exit_loss: float = 0.10   # Only used if time_exit_secs > 0
     mode: str = "paper"
     poll_interval: int = 15
-    log_file: str = "data/momentum_trades.jsonl"
+    log_file: str = "data/bounce_trades.jsonl"
     enabled_assets: dict = field(default_factory=lambda: {
         "btc": True, "eth": True, "sol": True
     })
@@ -132,7 +132,8 @@ class TradeLog:
                     for key, default in defaults.items():
                         if key not in t:
                             t[key] = default
-                    self._trades[t['trade_id']] = MomentumTrade(**t)
+                    valid = {f.name for f in fields(MomentumTrade)}
+                    self._trades[t['trade_id']] = MomentumTrade(**{k: v for k, v in t.items() if k in valid})
         except FileNotFoundError:
             pass
 
